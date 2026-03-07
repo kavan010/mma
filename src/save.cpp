@@ -8,14 +8,16 @@
 #include <cmath>
 #include <cstdlib>
 #include <list>
-
+#include <vector>
 using namespace glm;
 using namespace std;
 
-// --- constants ---
-const vec2 GRAVITY(0.0f, -120.0f);
+// --- constants ----
+const vec2 g(0.0f, 0.0f);
 
-// --- engine ---
+vec2 mousePos;
+bool mouseDown = false;
+
 struct Engine {
     GLFWwindow* window;
     int WIDTH = 800, HEIGHT = 600;
@@ -50,190 +52,306 @@ struct Engine {
         glMatrixMode(GL_MODELVIEW);
         glLoadIdentity();
     }
+
+    // ------ Callbacks ------
+    static void cursor_position_callback(GLFWwindow* window, double xpos, double ypos) {
+        int width, height;
+        glfwGetWindowSize(window, &width, &height);
+        mousePos = vec2(xpos - width/2.0, height/2.0 - ypos);
+    }
+    static void mouse_button_callback(GLFWwindow* window, int button, int action, int mods) {
+        if (button == GLFW_MOUSE_BUTTON_LEFT) {
+            mouseDown = (action == GLFW_PRESS);
+        }
+    }
+    float cross(vec2 a, vec2 b) {
+        return a.x*b.y - a.y*b.x;
+    }
 };
 Engine engine;
 
-struct Joint {
-    vec2 pos, old_pos;
+// --- structs ---
+struct Bone {
+    vec2 pos; float angle;
+    float halfLength, radius;
 
-    Joint(vec2 p) : pos(p), old_pos(p) {}
+    vec2 vel; // linear
+    float angularVelocity, mass, inertia;
+    float invMass, invInertia;
 
-    void update(float dt) {
-        vec2 vel = pos - old_pos;
-        old_pos = pos;
-        pos += vel + GRAVITY * dt * dt;
+    Bone (vec2 p, float a, float l, float r, float m) : pos(p), angle(a), halfLength(l), radius(r), mass(m) { 
+        vel = vec2(0.0f, 0.0f);
+        angularVelocity = 0.0f;
+        inertia = (1/12.0f) * m * halfLength*2 * halfLength*2; 
+        invMass = 1.0f / m;
+        invInertia = 1.0f / inertia;
+    }
+
+    // Compute the world-space point at local coordinate (x along bone, y perp)
+    vec2 worldPoint(vec2 local) const {
+        vec2 right = vec2(cos(angle), sin(angle));
+        vec2 up = vec2(-sin(angle), cos(angle));
+        return pos + right * local.x + up * local.y;
+    }
+
+    void draw() {
+        // direction of the bone
+        vec2 dir(cos(angle), sin(angle));
+
+        // endpoints derived from center + orientation
+        vec2 p1 = pos - dir * halfLength;
+        vec2 p2 = pos + dir * halfLength;
+
+        float len = glm::length(p2 - p1);
+        if (len == 0) return;
+
+        vec2 dirN = glm::normalize(p2 - p1);
+        vec2 right(-dirN.y, dirN.x);
+
+        // circle centers
+        vec2 c1 = p1 + dirN * radius;
+        vec2 c2 = p2 - dirN * radius;
+
+        vec2 rOffset = right * radius;
+
+        glColor4f(1,1,1,1);
+
+        // rectangle body
+        glBegin(GL_QUADS);
+            glVertex2f((c2 + rOffset).x, (c2 + rOffset).y);
+            glVertex2f((c2 - rOffset).x, (c2 - rOffset).y);
+            glVertex2f((c1 - rOffset).x, (c1 - rOffset).y);
+            glVertex2f((c1 + rOffset).x, (c1 + rOffset).y);
+        glEnd();
+
+        // circle 1
+        glBegin(GL_TRIANGLE_FAN);
+            glVertex2f(c1.x, c1.y);
+            for (int i = 0; i <= 20; i++) {
+                float a = (i / 20.0f) * 2.0f * glm::pi<float>();
+                glVertex2f(c1.x + cos(a)*radius, c1.y + sin(a)*radius);
+            }
+        glEnd();
+
+        // circle 2
+        glBegin(GL_TRIANGLE_FAN);
+            glVertex2f(c2.x, c2.y);
+            for (int i = 0; i <= 20; i++) {
+                float a = (i / 20.0f) * 2.0f * glm::pi<float>();
+                glVertex2f(c2.x + cos(a)*radius, c2.y + sin(a)*radius);
+            }
+        glEnd();
     }
 };
 
-void draw_circle(vec2 center, float radius) {
+struct Joint {
+    Bone* A;
+    Bone* B;
+    vec2 anchorA_local;   // anchor in local coordinates of A
+    vec2 anchorB_local;   // anchor in local coordinates of B
+
+    Joint(Bone* a, Bone* b, vec2 anchorA, vec2 anchorB) : A(a), B(b), anchorA_local(anchorA), anchorB_local(anchorB) { }
+};
+
+void drawCircle(vec2 pos, float radius) {
+    glColor3f(1,0, 0);
     glBegin(GL_TRIANGLE_FAN);
-    glVertex2f(center.x, center.y);
-    for (int i = 0; i <= 20; i++) {
-        float a = (i / 20.0f) * 2.0f * glm::pi<float>();
-        glVertex2f(center.x + cos(a) * radius, center.y + sin(a) * radius);
-    }
+        glVertex2f(pos.x, pos.y);
+        for (int i = 0; i <= 20; i++) {
+            float a = (i / 20.0f) * 2.0f * glm::pi<float>();
+            glVertex2f(pos.x + cos(a)*radius, pos.y + sin(a)*radius);
+        }
     glEnd();
 }
 
-struct Body {
-    Joint *j1, *j2;
-    float length;
 
-    Body(Joint* p1, Joint* p2, float len) : j1(p1), j2(p2), length(len) {}
+struct Skeleton {
+    list<Bone*> bones;
+    list<Joint> joints;
 
-    void solve() {
-        if (!j1 || !j2) return;
-        vec2 diff = j1->pos - j2->pos;
-        float d = glm::length(diff);
-        if (d == 0) return;
-        float diff_factor = (length - d) / d;
-        vec2 offset = diff * 0.5f * diff_factor;
+    Bone* body;
+    Bone* head;
+    Bone* hip;
+    Bone* shoulderR;
+    Bone* shoulderL;
+    Bone* armR;
+    Bone* armL;
+    Bone* forearmR;
+    Bone* forearmL;
+    Bone* legR;
+    Bone* legL;
+    Bone* calfR;
+    Bone* calfL;
 
-        j1->pos += offset;
-        j2->pos -= offset;
+    Skeleton() {
+        init();
     }
 
-    void draw(float radius) {
-        if (!j1 || !j2) return;
-        vec2 p1 = j1->pos;
-        vec2 p2 = j2->pos;
-
-        vec2 dir = p2 - p1;
-        if (glm::length(dir) == 0) return;
-        vec2 right = normalize(vec2(-dir.y, dir.x));
-        vec2 rOffset = right * radius;
-
-        glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+    void init() {
+                        // center     angle length radius
+        body      = new Bone(vec2(0, 150),       3.14f/2.0f,   25.0f, 25.0f,    60.0f);
+        head       = new Bone(vec2(0, 0),        0.0,          15.0f, 15.0f,    5.0f);
+        hip       = new Bone(vec2(0, 0),         0.0,          15.0f, 15.0f,    40.0f);
+        shoulderR     = new Bone(vec2(-150, 0),  0.0,          7.0f, 7.0f,      30.0f);
+        shoulderL     = new Bone(vec2(150, 0),   0.0,          7.0f, 7.0f,      30.0f);
+        armR      = new Bone(vec2(-150, 50),     3.14f/2.0f,   20.0f, 7.0f,     15.0f);
+        armL      = new Bone(vec2(150, 50),      3.14f/2.0f,   20.0f, 7.0f,     15.0f);
+        forearmR      = new Bone(vec2(-150, 50), 3.14f/2.0f,   20.0f, 7.0f,     10.0f);
+        forearmL      = new Bone(vec2(150, 50),  3.14f/2.0f,   20.0f, 7.0f,     10.0f);
+        legR      = new Bone(vec2(-150, 50),     3.14f/2.0f,   25.0f, 10.0f,    20.0f);
+        legL      = new Bone(vec2(150, 50),      3.14f/2.0f,   25.0f, 10.0f,    20.0f);
+        calfR      = new Bone(vec2(-150, 50),    3.14f/2.0f,   20.0f, 7.0f,     15.0f);
+        calfL      = new Bone(vec2(150, 50),     3.14f/2.0f,   20.0f, 7.0f,     15.0f);
         
-        glBegin(GL_QUADS);
-            glVertex2f((p2 + rOffset).x, (p2 + rOffset).y);
-            glVertex2f((p2 - rOffset).x, (p2 - rOffset).y);
-            glVertex2f((p1 - rOffset).x, (p1 - rOffset).y);
-            glVertex2f((p1 + rOffset).x, (p1 + rOffset).y);
-        glEnd();
 
-        draw_circle(p1, radius);
-        draw_circle(p2, radius);
+        bones.push_back(body);
+        bones.push_back(head);
+        bones.push_back(hip);
+        bones.push_back(shoulderR);
+        bones.push_back(shoulderL);
+        bones.push_back(armR);
+        bones.push_back(armL);
+        bones.push_back(forearmR);
+        bones.push_back(forearmL);
+        bones.push_back(legR);
+        bones.push_back(legL);
+        bones.push_back(calfR);
+        bones.push_back(calfL);
+
+                //  boneA     boneB    anchorA_local                  anchorB_local
+        Joint neck(body, head, vec2(body->halfLength, 0.0) , vec2(0.0, -head->halfLength));
+        Joint j0(body, hip, vec2(-body->halfLength, 0.0) , vec2(0, hip->halfLength));
+        Joint j1(body, shoulderR, vec2(body->halfLength*0.34, -body->radius*0.94) , vec2(0,0));
+        Joint j2(body, shoulderL, vec2(body->halfLength*0.34, body->radius*0.94)  , vec2(0,0));
+        Joint j3(shoulderR, armR, vec2(0, 0)  , vec2(armR->halfLength, -0));
+        Joint j4(shoulderL, armL, vec2(0, 0)  , vec2(armL->halfLength, -0));
+        Joint elbowR(armR, forearmR, vec2(-armR->halfLength, 0)  , vec2(forearmR->halfLength, 0));
+        Joint elbowL(armL, forearmL, vec2(-armL->halfLength, 0)  , vec2(forearmL->halfLength, 0));
+        Joint hipR(hip, legR, vec2(-hip->radius*0.71, -hip->radius*0.71)  , vec2(legR->halfLength, 0));
+        Joint hipL(hip, legL, vec2(hip->radius*0.71,  -hip->radius*0.71)  , vec2(legL->halfLength, 0));
+        Joint kneeR(legR, calfR, vec2(-legR->halfLength, 0)  , vec2(calfR->halfLength, 0));
+        Joint kneeL(legL, calfL, vec2(-legL->halfLength, 0)  , vec2(calfL->halfLength, 0));
+
+        joints.push_back(neck);
+        joints.push_back(j0);
+        joints.push_back(j1);
+        joints.push_back(j2);
+        joints.push_back(j3);
+        joints.push_back(j4);
+        joints.push_back(elbowR);
+        joints.push_back(elbowL);
+        joints.push_back(hipR);
+        joints.push_back(hipL);
+        joints.push_back(kneeR);
+        joints.push_back(kneeL);
+
+        for (Joint& j : joints) {
+            vec2 worldA = j.A->worldPoint(j.anchorA_local);
+            vec2 worldB = j.B->worldPoint(j.anchorB_local);
+
+            drawCircle(worldA, 5.0f);
+            drawCircle(worldB, 5.0f);
+
+            vec2 error = worldA - worldB;
+
+            j.B->pos += error;
+        }
     }
 };
 
-list<Joint> joints;
-list<Body> bodies;
-Joint* dragged_joint = nullptr;
-vec2 mouse_pos;
-
-void cursor_position_callback(GLFWwindow* window, double xpos, double ypos) {
-    int width, height;
-    glfwGetWindowSize(window, &width, &height);
-    mouse_pos.x = (float)xpos - (float)width / 2.0f;
-    mouse_pos.y = (float)height / 2.0f - (float)ypos;
-}
-
-void mouse_button_callback(GLFWwindow* window, int button, int action, int mods) {
-    if (button == GLFW_MOUSE_BUTTON_LEFT) {
-        if (action == GLFW_PRESS) {
-            float closest_dist_sq = 20.0f * 20.0f; // Grab radius
-            Joint* closest_joint = nullptr;
-            for (auto& j : joints) {
-                vec2 diff = mouse_pos - j.pos;
-                float dist_sq = dot(diff, diff);
-                if (dist_sq < closest_dist_sq) {
-                    closest_dist_sq = dist_sq;
-                    closest_joint = &j;
-                }
-            }
-            dragged_joint = closest_joint;
-        } else if (action == GLFW_RELEASE) {
-            dragged_joint = nullptr;
-        }
-    }
-}
-
-void constrain_joints_to_screen(float width, float height) {
-    float friction = 0.8f; 
-    float buffer = 4.0f; 
-
-    float half_w = width / 2.0f - buffer;
-    float half_h = height / 2.0f - buffer;
-
-    for (auto& j : joints) {
-        vec2 vel = j.pos - j.old_pos;
-
-        if (j.pos.x < -half_w) {
-            j.pos.x = -half_w;
-            j.old_pos.x = j.pos.x + vel.x * friction;
-        }
-        else if (j.pos.x > half_w) {
-            j.pos.x = half_w;
-            j.old_pos.x = j.pos.x + vel.x * friction;
-        }
-
-        if (j.pos.y < -half_h) {
-            j.pos.y = -half_h;
-            j.old_pos.y = j.pos.y + vel.y * friction;
-        }
-        else if (j.pos.y > half_h) {
-            j.pos.y = half_h;
-            j.old_pos.y = j.pos.y + vel.y * friction;
-        }
-    }
-}
-
 int main () {
-    glfwSetCursorPosCallback(engine.window, cursor_position_callback);
-    glfwSetMouseButtonCallback(engine.window, mouse_button_callback);
+    Skeleton* sk = new Skeleton();
 
-    // --- Create a structure ---
-    // 4 double pendulums attached to a central joint
-    joints.emplace_back(vec2(0, 250));
-    Joint* center_joint = &joints.back();
+    glfwSetCursorPosCallback(engine.window,   Engine::cursor_position_callback);
+    glfwSetMouseButtonCallback(engine.window, Engine::mouse_button_callback);
 
-    for (int i = 0; i < 4; ++i) {
-        float angle = (float)i / 4.0f * (2.0f * glm::pi<float>());
-        float l1 = 80.0f + i * 15.0f;
-        float l2 = 70.0f - i * 10.0f;
+    sk->forearmL->vel = vec2(0.0f, 0.0f); // initial velocity to test
 
-        // Create the middle and end joints for this arm, starting slightly offset
-        vec2 mid_pos = center_joint->pos + vec2(cos(angle), sin(angle)) * 2.0f;
-        joints.emplace_back(mid_pos);
-        Joint* mid_joint = &joints.back();
+    Bone* dragBone = nullptr;
+    vec2 dragOffset;
 
-        vec2 end_pos = mid_joint->pos + vec2(cos(angle), sin(angle)) * 2.0f;
-        joints.emplace_back(end_pos);
-        Joint* end_joint = &joints.back();
-
-        // Create the bodies (constraints)
-        bodies.emplace_back(center_joint, mid_joint, l1);
-        bodies.emplace_back(mid_joint, end_joint, l2);
-    }
-    
-    float dt = 1.0f / 60.0f;
-    int solver_iterations = 8;
-
+    float dt = 1.0f/60.0f;
     while (!glfwWindowShouldClose(engine.window)) {
         engine.run();
 
-        for (auto& j : joints) {
-            j.update(dt);
-        }
-        
-        constrain_joints_to_screen(engine.WIDTH, engine.HEIGHT);
-
-        if (dragged_joint) {
-            dragged_joint->pos = mouse_pos;
-        }
-
-        for (int i = 0; i < solver_iterations; ++i) {
-            for (auto& b : bodies) {
-                b.solve();
+        // --- Select drag bone ---
+        if (mouseDown && !dragBone) {
+            for (Bone* b : sk->bones) {
+                if (length(mousePos - b->pos) < 30.0f) {
+                    dragBone = b;
+                    vec2 d = mousePos - b->pos;
+                    dragOffset = vec2(d.x*cos(-b->angle) - d.y*sin(-b->angle), d.x*sin(-b->angle) + d.y*cos(-b->angle));
+                    break;
+                }
             }
-             if (dragged_joint) {
-                dragged_joint->pos = mouse_pos;
+        } else if (!mouseDown) dragBone = nullptr;
+
+        vector<vec2> oldPos;
+        vector<float> oldAng;
+
+        // integrate motion first
+        for (Bone* b : sk->bones) {
+            oldPos.push_back(b->pos);
+            oldAng.push_back(b->angle);
+
+            // b->vel += vec2(0, -500.0f) * dt; // gravity
+            if (b == dragBone) {
+                vec2 wp = b->worldPoint(dragOffset);
+                vec2 f = (mousePos - wp) * 500.0f; // spring force
+                b->vel += f * b->invMass * dt;
+                vec2 r = wp - b->pos;
+                b->angularVelocity += (r.x*f.y - r.y*f.x) * b->invInertia * dt;
+            }
+            b->vel *= 0.99f; b->angularVelocity *= 0.99f; // damping
+
+            b->pos += b->vel * dt;
+            b->angle += b->angularVelocity * dt;
+        }
+
+        // solve joints several times
+        for(int i=0;i<10;i++) {
+            for (Joint& j : sk->joints) {
+                // world anchors
+                vec2 worldA = j.A->worldPoint(j.anchorA_local);
+                vec2 worldB = j.B->worldPoint(j.anchorB_local);
+
+                // distance from anchor to centre of mass (for torque)
+                vec2 rA = worldA - j.A->pos;
+                vec2 rB = worldB - j.B->pos;
+
+                vec2 error = worldB - worldA;
+
+                // Compute effective mass matrix K for the constraint
+                float k11 = j.A->invMass     + j.B->invMass  + j.A->invInertia * rA.y * rA.y + j.B->invInertia * rB.y * rB.y;
+                float k12 = -j.A->invInertia * rA.x * rA.y   - j.B->invInertia * rB.x * rB.y;
+                float k22 = j.A->invMass     + j.B->invMass  + j.A->invInertia * rA.x * rA.x + j.B->invInertia * rB.x * rB.x;
+
+                float det = k11 * k22 - k12 * k12;
+                if (abs(det) < 1e-6f) continue;
+
+                // Solve for impulse P
+                vec2 P;
+                P.x = (k22 * error.x - k12 * error.y) / det;
+                P.y = (-k12 * error.x + k11 * error.y) / det;
+
+                // Apply correction to position and angle (torque effect)
+                j.A->pos += P * j.A->invMass;
+                j.A->angle += j.A->invInertia * (rA.x * P.y - rA.y * P.x);
+                j.B->pos -= P * j.B->invMass;
+                j.B->angle -= j.B->invInertia * (rB.x * P.y - rB.y * P.x);
             }
         }
 
-        for (auto& b : bodies) {
-            b.draw(4.0f);
+        int idx = 0;
+        for (Bone* b : sk->bones) {
+            b->vel = (b->pos - oldPos[idx]) / dt;
+            b->angularVelocity = (b->angle - oldAng[idx]) / dt;
+            idx++;
+        }
+
+        // --- PHASE 4: Draw ---
+        for (Bone* b : sk->bones) {
+            b->draw();
         }
 
         glfwSwapBuffers(engine.window);
