@@ -5,8 +5,8 @@
             "name": "g++ Debug",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/bin/fusion.exe",
-            //"program": "${workspaceFolder}/bin/fusion.exe",           // here
+            "program": "${workspaceFolder}/bin/mma.exe",
+            //"program": "${workspaceFolder}/bin/mma.exe",           // here
             "args": [],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}/src",
@@ -27,8 +27,8 @@
             "name": "CUDA Debug",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/bin/fusion.exe",
-            //"program": "${workspaceFolder}/bin/fusion.exe",           // here
+            "program": "${workspaceFolder}/bin/mma.exe",
+            //"program": "${workspaceFolder}/bin/fmma.exe",           // here
             "args": [],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}/src",

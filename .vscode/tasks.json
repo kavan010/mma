@@ -8,11 +8,11 @@
             "args": [
                 "-fdiagnostics-color=always",
                 "-g",
-                "${workspaceFolder}/src/fusion.cpp",
-                //"${workspaceFolder}/src/fusion.cpp",           // here
+                "${workspaceFolder}/src/mma.cpp",
+                //"${workspaceFolder}/src/mma.cpp",           // here
                 "-o",
-                "${workspaceFolder}/bin/fusion.exe",
-                //"${workspaceFolder}/bin/fusion.exe",           // here
+                "${workspaceFolder}/bin/mma.exe",
+                //"${workspaceFolder}/bin/mma.exe",           // here
                 "-IC:/msys64/mingw64/include",
                 "-LC:/msys64/mingw64/lib",
                 "-lglfw3",
