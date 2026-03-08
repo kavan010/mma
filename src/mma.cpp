@@ -163,7 +163,8 @@ struct Joint {
 
     // --- PD Controller Properties ---
     float targetAngle = 0.0f;
-    float stiffness = 0.0f; // k_p: How strongly it tries to reach the target angle.
+    float stiffness = 0.0f;    // k_p: How strongly it tries to reach the target angle.
+    float damping = 2000.0f;   // k_d: How much it resists motion to prevent overshoot.
 
     Joint(Bone* a, Bone* b, vec2 anchorA, vec2 anchorB) : A(a), B(b), anchorA_local(anchorA), anchorB_local(anchorB) {
         // Set initial target angle to the current relative angle so it's not floppy at the start
@@ -333,13 +334,23 @@ void key_callback(GLFWwindow* window, int key, int scancode, int action, int mod
     if (key == GLFW_KEY_RIGHT) { it->targetAngle += angleIncrement; cout << "Target: " << it->targetAngle << endl; }
     if (key == GLFW_KEY_LEFT)  { it->targetAngle -= angleIncrement; cout << "Target: " << it->targetAngle << endl; }
 
+    const float MAX_STIFFNESS = 3e6f;
     if (key == GLFW_KEY_W) {
-        it->stiffness += 100000.0f;
+        it->stiffness = fmin(it->stiffness + 100000.0f, MAX_STIFFNESS);
         cout << "Stiffness: " << it->stiffness << endl;
     }
     if (key == GLFW_KEY_S) {
-        it->stiffness -= 100000.0f;
+        it->stiffness = fmax(it->stiffness - 20000.0f, 0.0f);
         cout << "Stiffness: " << it->stiffness << endl;
+    }
+
+    if (key == GLFW_KEY_E) {
+        it->damping += 500.0f;
+        cout << "Damping: " << it->damping << endl;
+    }
+    if (key == GLFW_KEY_D) {
+        it->damping = fmax(it->damping - 500.0f, 0.0f);
+        cout << "Damping: " << it->damping << endl;
     }
 }
 
@@ -380,10 +391,18 @@ int main () {
             // 2. Calculate the shortest angle difference (error)
             float error = j.targetAngle - currentAngle;
 
-            // 4. Calculate torque using the PD formula
-            float torque = (j.stiffness * error);
+            // 3. Calculate the difference in angular velocities (derivative error)
+            float angularVelDiff = j.B->angularVelocity - j.A->angularVelocity;
 
-            // 5. Apply the torque to the bones
+            // 4. Calculate torque using the full PD formula
+            float torque = (j.stiffness * error) - (j.damping * angularVelDiff);
+
+            // 5. Clamp the torque to prevent explosions.
+            // This acts as a physical limit on the joint's strength.
+            float maxTorque = 5e7f;
+            torque = fmax(-maxTorque, fmin(torque, maxTorque));
+
+            // 6. Apply the final torque to the bones
             j.A->angularVelocity -= torque * j.A->invInertia * dt;
             j.B->angularVelocity += torque * j.B->invInertia * dt;
         }
