@@ -13,7 +13,7 @@ using namespace glm;
 using namespace std;
 
 // --- constants ----
-const vec2 g(0.0f, 0.0f);
+const vec2 g(0.0f, -98.0f);
 
 vec2 mousePos;
 bool mouseDown = false;
@@ -70,6 +70,12 @@ struct Engine {
 };
 Engine engine;
 
+// --- Globals for UI ---
+int selectedJointIndex = 0;
+struct Skeleton; // Forward declaration
+Skeleton* sk_ptr = nullptr;
+
+
 // --- structs ---
 struct Bone {
     vec2 pos; float angle;
@@ -79,10 +85,15 @@ struct Bone {
     float angularVelocity, mass, inertia;
     float invMass, invInertia;
 
+    vec2 oldPos; float oldAngle;
+
     Bone (vec2 p, float a, float l, float r, float m) : pos(p), angle(a), halfLength(l), radius(r), mass(m) { 
         vel = vec2(0.0f, 0.0f);
         angularVelocity = 0.0f;
-        inertia = (1/12.0f) * m * halfLength*2 * halfLength*2; 
+        // Use a box approximation for inertia: I = 1/12 * m * (h^2 + w^2).
+        // The simple rod formula (1/12 * m * h^2) is unstable for "fat" objects like the head
+        // because it ignores the radius, making them too easy to spin.
+        inertia = (1.0f/12.0f) * m * (pow(halfLength*2.0f, 2) + pow(radius*2.0f, 2));
         invMass = 1.0f / m;
         invInertia = 1.0f / inertia;
     }
@@ -150,11 +161,18 @@ struct Joint {
     vec2 anchorA_local;   // anchor in local coordinates of A
     vec2 anchorB_local;   // anchor in local coordinates of B
 
-    Joint(Bone* a, Bone* b, vec2 anchorA, vec2 anchorB) : A(a), B(b), anchorA_local(anchorA), anchorB_local(anchorB) { }
+    // --- PD Controller Properties ---
+    float targetAngle = 0.0f;
+    float stiffness = 0.0f; // k_p: How strongly it tries to reach the target angle.
+
+    Joint(Bone* a, Bone* b, vec2 anchorA, vec2 anchorB) : A(a), B(b), anchorA_local(anchorA), anchorB_local(anchorB) {
+        // Set initial target angle to the current relative angle so it's not floppy at the start
+        targetAngle = B->angle - A->angle;
+    }
 };
 
-void drawCircle(vec2 pos, float radius) {
-    glColor3f(1,0, 0);
+void drawCircle(vec2 pos, float radius, vec3 color) {
+    glColor3f(color.r, color.g, color.b);
     glBegin(GL_TRIANGLE_FAN);
         glVertex2f(pos.x, pos.y);
         for (int i = 0; i <= 20; i++) {
@@ -164,24 +182,59 @@ void drawCircle(vec2 pos, float radius) {
     glEnd();
 }
 
+// --- Physics ---
+void checkBorderCollision(Bone* b) {
+    float halfWidth = engine.WIDTH / 2.0f;
+    float halfHeight = engine.HEIGHT / 2.0f;
+    float floorLevel = -halfHeight + 200.0f;
+
+    vec2 dir(cos(b->angle), sin(b->angle));
+    vec2 offset = dir * b->halfLength;
+    vec2 p1 = b->pos - offset;
+    vec2 p2 = b->pos + offset;
+
+    float minX = fmin(p1.x, p2.x) - b->radius;
+    float maxX = fmax(p1.x, p2.x) + b->radius;
+    float minY = fmin(p1.y, p2.y) - b->radius;
+    float maxY = fmax(p1.y, p2.y) + b->radius;
+
+    if (minX < -halfWidth) {
+        float fix = -halfWidth - minX;
+        b->pos.x += fix;
+        // Kill velocity normal to the wall to prevent bouncing (inelastic collision)
+        b->oldPos.x = b->pos.x;
+    }
+    if (maxX >  halfWidth) {
+        float fix = halfWidth - maxX;
+        b->pos.x += fix;
+        // Kill velocity normal to the wall to prevent bouncing (inelastic collision)
+        b->oldPos.x = b->pos.x;
+    }
+    if (minY < floorLevel) {
+        float fix = floorLevel - minY;
+        b->pos.y += fix;
+        // Kill velocity normal to the wall to prevent bouncing (inelastic collision)
+        b->oldPos.y = b->pos.y;
+    }
+    if (maxY > halfHeight) {
+        float fix = halfHeight - maxY;
+        b->pos.y += fix;
+        // Kill velocity normal to the wall to prevent bouncing (inelastic collision)
+        b->oldPos.y = b->pos.y;
+    }
+}
+
 
 struct Skeleton {
     list<Bone*> bones;
     list<Joint> joints;
 
-    Bone* body;
-    Bone* head;
-    Bone* hip;
-    Bone* shoulderR;
-    Bone* shoulderL;
-    Bone* armR;
-    Bone* armL;
-    Bone* forearmR;
-    Bone* forearmL;
-    Bone* legR;
-    Bone* legL;
-    Bone* calfR;
-    Bone* calfL;
+    Bone* body; Bone* head; Bone* hip;
+    Bone* shoulderR; Bone* shoulderL;
+    Bone* armR; Bone* armL;
+    Bone* forearmR; Bone* forearmL;
+    Bone* legR; Bone* legL;
+    Bone* calfR; Bone* calfL;
 
     Skeleton() {
         init();
@@ -189,8 +242,8 @@ struct Skeleton {
 
     void init() {
                         // center     angle length radius
-        body      = new Bone(vec2(0, 150),       3.14f/2.0f,   25.0f, 25.0f,    60.0f);
-        head       = new Bone(vec2(0, 0),        0.0,          15.0f, 15.0f,    5.0f);
+        body      = new Bone(vec2(0, 150),       3.14f/2.0f,   25.0f, 25.0f,    60.0f); // Torso
+        head       = new Bone(vec2(0, 0),        0.0,          15.0f, 15.0f,    5.0f);  // Head
         hip       = new Bone(vec2(0, 0),         0.0,          15.0f, 15.0f,    40.0f);
         shoulderR     = new Bone(vec2(-150, 0),  0.0,          7.0f, 7.0f,      30.0f);
         shoulderL     = new Bone(vec2(150, 0),   0.0,          7.0f, 7.0f,      30.0f);
@@ -249,9 +302,6 @@ struct Skeleton {
             vec2 worldA = j.A->worldPoint(j.anchorA_local);
             vec2 worldB = j.B->worldPoint(j.anchorB_local);
 
-            drawCircle(worldA, 5.0f);
-            drawCircle(worldB, 5.0f);
-
             vec2 error = worldA - worldB;
 
             j.B->pos += error;
@@ -259,21 +309,57 @@ struct Skeleton {
     }
 };
 
+void key_callback(GLFWwindow* window, int key, int scancode, int action, int mods) {
+    if (action != GLFW_PRESS && action != GLFW_REPEAT) return;
+    if (!sk_ptr) return;
+
+    if (key == GLFW_KEY_UP) {
+        selectedJointIndex = (selectedJointIndex + 1) % sk_ptr->joints.size();
+        auto it = sk_ptr->joints.begin();
+        std::advance(it, selectedJointIndex);
+        cout << "Joint " << selectedJointIndex << " Target: " << it->targetAngle << endl;
+    }
+    if (key == GLFW_KEY_DOWN) {
+        selectedJointIndex = (selectedJointIndex > 0) ? selectedJointIndex - 1 : sk_ptr->joints.size() - 1;
+        auto it = sk_ptr->joints.begin();
+        std::advance(it, selectedJointIndex);
+        cout << "Joint " << selectedJointIndex << " Target: " << it->targetAngle << endl;
+    }
+
+    auto it = sk_ptr->joints.begin();
+    std::advance(it, selectedJointIndex);
+    float angleIncrement = 0.1f; // radians
+
+    if (key == GLFW_KEY_RIGHT) { it->targetAngle += angleIncrement; cout << "Target: " << it->targetAngle << endl; }
+    if (key == GLFW_KEY_LEFT)  { it->targetAngle -= angleIncrement; cout << "Target: " << it->targetAngle << endl; }
+
+    if (key == GLFW_KEY_W) {
+        it->stiffness += 100000.0f;
+        cout << "Stiffness: " << it->stiffness << endl;
+    }
+    if (key == GLFW_KEY_S) {
+        it->stiffness -= 100000.0f;
+        cout << "Stiffness: " << it->stiffness << endl;
+    }
+}
+
 int main () {
     Skeleton* sk = new Skeleton();
+    sk_ptr = sk; // Give global pointer access to the skeleton for the callback
 
     glfwSetCursorPosCallback(engine.window,   Engine::cursor_position_callback);
     glfwSetMouseButtonCallback(engine.window, Engine::mouse_button_callback);
-
-    sk->forearmL->vel = vec2(0.0f, 0.0f); // initial velocity to test
+    glfwSetKeyCallback(engine.window, key_callback);
 
     Bone* dragBone = nullptr;
     vec2 dragOffset;
 
-    float dt = 1.0f/60.0f;
+    float dt = 0.032f;
     while (!glfwWindowShouldClose(engine.window)) {
         engine.run();
 
+
+        // -------- SKELETON MECHANICS --------
         // --- Select drag bone ---
         if (mouseDown && !dragBone) {
             for (Bone* b : sk->bones) {
@@ -286,53 +372,69 @@ int main () {
             }
         } else if (!mouseDown) dragBone = nullptr;
 
-        vector<vec2> oldPos;
-        vector<float> oldAng;
+        // --- Joint Controls (PD Controller) ---
+        for (Joint& j : sk->joints) {
+            // 1. Calculate current relative angle between the two bones
+            float currentAngle = j.B->angle - j.A->angle;
 
-        // integrate motion first
+            // 2. Calculate the shortest angle difference (error)
+            float error = j.targetAngle - currentAngle;
+
+            // 4. Calculate torque using the PD formula
+            float torque = (j.stiffness * error);
+
+            // 5. Apply the torque to the bones
+            j.A->angularVelocity -= torque * j.A->invInertia * dt;
+            j.B->angularVelocity += torque * j.B->invInertia * dt;
+        }
+
+        // integrate motion
         for (Bone* b : sk->bones) {
-            oldPos.push_back(b->pos);
-            oldAng.push_back(b->angle);
-
-            // b->vel += vec2(0, -500.0f) * dt; // gravity
-            if (b == dragBone) {
-                vec2 wp = b->worldPoint(dragOffset);
-                vec2 f = (mousePos - wp) * 500.0f; // spring force
-                b->vel += f * b->invMass * dt;
-                vec2 r = wp - b->pos;
-                b->angularVelocity += (r.x*f.y - r.y*f.x) * b->invInertia * dt;
-            }
-            b->vel *= 0.99f; b->angularVelocity *= 0.99f; // damping
+            b->vel += g * dt; // gravity
+            b->oldPos = b->pos;
+            b->oldAngle = b->angle;
+            
+            b->vel*=0.99f; b->angularVelocity*=0.99f; // damping
 
             b->pos += b->vel * dt;
+            checkBorderCollision(b);
             b->angle += b->angularVelocity * dt;
         }
 
-        // solve joints several times
-        for(int i=0;i<10;i++) {
+        // solve for joints and momentum
+        for (int iteration = 0; iteration < 8; iteration++) {
+            // --- Mouse Constraint (Stable Drag) ---
+            if (dragBone) {
+                dragBone->pos = mousePos;
+            }
+
             for (Joint& j : sk->joints) {
                 // world anchors
                 vec2 worldA = j.A->worldPoint(j.anchorA_local);
                 vec2 worldB = j.B->worldPoint(j.anchorB_local);
 
-                // distance from anchor to centre of mass (for torque)
-                vec2 rA = worldA - j.A->pos;
-                vec2 rB = worldB - j.B->pos;
+                vec2 mid = (worldA + worldB) * 0.5f;
 
-                vec2 error = worldB - worldA;
+                // distance from anchor to centre of mass (for torque)
+                vec2 rA = mid - j.A->pos;
+                vec2 rB = mid - j.B->pos;
+
+                // distance from anchor
+                vec2 error = (worldB - worldA);
 
                 // Compute effective mass matrix K for the constraint
                 float k11 = j.A->invMass     + j.B->invMass  + j.A->invInertia * rA.y * rA.y + j.B->invInertia * rB.y * rB.y;
                 float k12 = -j.A->invInertia * rA.x * rA.y   - j.B->invInertia * rB.x * rB.y;
                 float k22 = j.A->invMass     + j.B->invMass  + j.A->invInertia * rA.x * rA.x + j.B->invInertia * rB.x * rB.x;
 
-                float det = k11 * k22 - k12 * k12;
+                float det = k11*k22 - k12*k12;
                 if (abs(det) < 1e-6f) continue;
 
                 // Solve for impulse P
-                vec2 P;
-                P.x = (k22 * error.x - k12 * error.y) / det;
-                P.y = (-k12 * error.x + k11 * error.y) / det;
+                vec2 P{
+                    (k22*error.x - k12*error.y)/det,
+                    (-k12*error.x + k11*error.y)/det
+                };
 
                 // Apply correction to position and angle (torque effect)
                 j.A->pos += P * j.A->invMass;
@@ -342,16 +444,30 @@ int main () {
             }
         }
 
-        int idx = 0;
+        // Update velocities and draw
         for (Bone* b : sk->bones) {
-            b->vel = (b->pos - oldPos[idx]) / dt;
-            b->angularVelocity = (b->angle - oldAng[idx]) / dt;
-            idx++;
+            b->vel = (b->pos - b->oldPos) / dt;
+            b->angularVelocity = (b->angle - b->oldAngle) / dt;
+            b->draw();
         }
 
-        // --- PHASE 4: Draw ---
-        for (Bone* b : sk->bones) {
-            b->draw();
+        // Draw UI for selected joint
+        if (!sk->joints.empty()) {
+            auto it = sk->joints.begin();
+            std::advance(it, selectedJointIndex);
+            vec2 jointPos = it->A->worldPoint(it->anchorA_local);
+            
+            // Draw red circle on selected joint
+            drawCircle(jointPos, 8.0f, vec3(1,0,0));
+
+            // Draw line indicating target angle
+            float targetWorldAngle = it->A->angle + it->targetAngle;
+            vec2 targetDir = vec2(cos(targetWorldAngle), sin(targetWorldAngle));
+            glColor3f(0,1,0);
+            glBegin(GL_LINES);
+                glVertex2fv(value_ptr(jointPos));
+                glVertex2fv(value_ptr(jointPos + targetDir * 30.0f));
+            glEnd();
         }
 
         glfwSwapBuffers(engine.window);
