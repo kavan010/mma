@@ -13,10 +13,9 @@ using namespace glm;
 using namespace std;
 
 // --- constants ----
-const vec2 g(0.0f, -98.0f);
+const vec2 g(0.0f, -194.0f);
 
-vec2 mousePos;
-bool mouseDown = false;
+vec2 mousePos; bool mouseDown = false;
 
 struct Engine {
     GLFWwindow* window;
@@ -67,8 +66,24 @@ struct Engine {
     float cross(vec2 a, vec2 b) {
         return a.x*b.y - a.y*b.x;
     }
+    void drawCircle(vec2 pos, float radius, vec3 color) {
+        glColor3f(color.r, color.g, color.b);
+        glBegin(GL_TRIANGLE_FAN);
+            glVertex2f(pos.x, pos.y);
+            for (int i = 0; i <= 20; i++) {
+                float a = (i / 20.0f) * 2.0f * glm::pi<float>();
+                glVertex2f(pos.x + cos(a)*radius, pos.y + sin(a)*radius);
+            }
+        glEnd();
+    }
 };
 Engine engine;
+
+// --- Globals for UI ---
+int selectedJointIndex = 0;
+struct Skeleton;
+Skeleton* sk_ptr = nullptr;
+
 
 // --- structs ---
 struct Bone {
@@ -84,7 +99,10 @@ struct Bone {
     Bone (vec2 p, float a, float l, float r, float m) : pos(p), angle(a), halfLength(l), radius(r), mass(m) { 
         vel = vec2(0.0f, 0.0f);
         angularVelocity = 0.0f;
-        inertia = (1/12.0f) * m * halfLength*2 * halfLength*2; 
+        // Use a box approximation for inertia: I = 1/12 * m * (h^2 + w^2).
+        // The simple rod formula (1/12 * m * h^2) is unstable for "fat" objects like the head
+        // because it ignores the radius, making them too easy to spin.
+        inertia = (1.0f/12.0f) * m * (pow(halfLength*2.0f, 2) + pow(radius*2.0f, 2));
         invMass = 1.0f / m;
         invInertia = 1.0f / inertia;
     }
@@ -152,17 +170,59 @@ struct Joint {
     vec2 anchorA_local;   // anchor in local coordinates of A
     vec2 anchorB_local;   // anchor in local coordinates of B
 
-    Joint(Bone* a, Bone* b, vec2 anchorA, vec2 anchorB) : A(a), B(b), anchorA_local(anchorA), anchorB_local(anchorB) { }
+    // --- PD Controller Properties ---
+    float targetAngle = 0.0f;
+    float stiffness = 0.0f;    // k_p: How strongly it tries to reach the target angle.
+    float damping = 10000.0f;   // k_d: How much it resists motion to prevent overshoot.
+
+    Joint(Bone* a, Bone* b, vec2 anchorA, vec2 anchorB) : A(a), B(b), anchorA_local(anchorA), anchorB_local(anchorB) {
+        // Set initial target angle to the current relative angle so it's not floppy at the start
+        targetAngle = B->angle - A->angle;
+    }
 };
 
+
+
+// --- Physics ---
 void checkBorderCollision(Bone* b) {
     float halfWidth = engine.WIDTH / 2.0f;
     float halfHeight = engine.HEIGHT / 2.0f;
+    float floorLevel = -halfHeight + 50.0f;
 
-    if (b->pos.x < -halfWidth + b->radius)  b->pos.x = -halfWidth + b->radius;
-    if (b->pos.x >  halfWidth - b->radius)  b->pos.x =  halfWidth - b->radius;
-    if (b->pos.y < -halfHeight + b->radius) b->pos.y = -halfHeight + b->radius;
-    if (b->pos.y >  halfHeight - b->radius) b->pos.y =  halfHeight - b->radius;
+    vec2 dir(cos(b->angle), sin(b->angle));
+    vec2 offset = dir * b->halfLength;
+    vec2 p1 = b->pos - offset;
+    vec2 p2 = b->pos + offset;
+
+    float minX = fmin(p1.x, p2.x) - b->radius;
+    float maxX = fmax(p1.x, p2.x) + b->radius;
+    float minY = fmin(p1.y, p2.y) - b->radius;
+    float maxY = fmax(p1.y, p2.y) + b->radius;
+
+    if (minX < -halfWidth) {
+        float fix = -halfWidth - minX;
+        b->pos.x += fix;
+        // Kill velocity normal to the wall to prevent bouncing (inelastic collision)
+        b->oldPos.x = b->pos.x;
+    }
+    if (maxX >  halfWidth) {
+        float fix = halfWidth - maxX;
+        b->pos.x += fix;
+        // Kill velocity normal to the wall to prevent bouncing (inelastic collision)
+        b->oldPos.x = b->pos.x;
+    }
+    if (minY < floorLevel) {
+        float fix = floorLevel - minY;
+        b->pos.y += fix;
+        // Kill velocity normal to the wall to prevent bouncing (inelastic collision)
+        b->oldPos.y = b->pos.y;
+    }
+    if (maxY > halfHeight) {
+        float fix = halfHeight - maxY;
+        b->pos.y += fix;
+        // Kill velocity normal to the wall to prevent bouncing (inelastic collision)
+        b->oldPos.y = b->pos.y;
+    }
 }
 
 
@@ -171,11 +231,15 @@ struct Skeleton {
     list<Joint> joints;
 
     Bone* body; Bone* head; Bone* hip;
-    Bone* shoulderR; Bone* shoulderL;
     Bone* armR; Bone* armL;
     Bone* forearmR; Bone* forearmL;
     Bone* legR; Bone* legL;
     Bone* calfR; Bone* calfL;
+
+    Joint* neck; Joint* j0; Joint* j1; Joint* j2;
+    Joint* elbowR; Joint* elbowL;
+    Joint* hipR; Joint* hipL;
+    Joint* kneeR; Joint* kneeL;
 
     Skeleton() {
         init();
@@ -183,11 +247,9 @@ struct Skeleton {
 
     void init() {
                         // center     angle length radius
-        body      = new Bone(vec2(0, 150),       3.14f/2.0f,   25.0f, 25.0f,    60.0f);
-        head       = new Bone(vec2(0, 0),        0.0,          15.0f, 15.0f,    50.0f);
+        body      = new Bone(vec2(0, 150),       3.14f/2.0f,   25.0f, 25.0f,    60.0f); // Torso
+        head       = new Bone(vec2(0, 0),        0.0,          15.0f, 15.0f,    5.0f);  // Head
         hip       = new Bone(vec2(0, 0),         0.0,          15.0f, 15.0f,    40.0f);
-        shoulderR     = new Bone(vec2(-150, 0),  0.0,          7.0f, 7.0f,      30.0f);
-        shoulderL     = new Bone(vec2(150, 0),   0.0,          7.0f, 7.0f,      30.0f);
         armR      = new Bone(vec2(-150, 50),     3.14f/2.0f,   20.0f, 7.0f,     15.0f);
         armL      = new Bone(vec2(150, 50),      3.14f/2.0f,   20.0f, 7.0f,     15.0f);
         forearmR      = new Bone(vec2(-150, 50), 3.14f/2.0f,   20.0f, 7.0f,     10.0f);
@@ -201,8 +263,6 @@ struct Skeleton {
         bones.push_back(body);
         bones.push_back(head);
         bones.push_back(hip);
-        bones.push_back(shoulderR);
-        bones.push_back(shoulderL);
         bones.push_back(armR);
         bones.push_back(armL);
         bones.push_back(forearmR);
@@ -213,31 +273,27 @@ struct Skeleton {
         bones.push_back(calfL);
 
                 //  boneA     boneB    anchorA_local                  anchorB_local
-        Joint neck(body, head, vec2(body->halfLength, 0.0) , vec2(0.0, -head->halfLength));
-        Joint j0(body, hip, vec2(-body->halfLength, 0.0) , vec2(0, hip->halfLength));
-        Joint j1(body, shoulderR, vec2(body->halfLength*0.34, -body->radius*0.94) , vec2(0,0));
-        Joint j2(body, shoulderL, vec2(body->halfLength*0.34, body->radius*0.94)  , vec2(0,0));
-        Joint j3(shoulderR, armR, vec2(0, 0)  , vec2(armR->halfLength, -0));
-        Joint j4(shoulderL, armL, vec2(0, 0)  , vec2(armL->halfLength, -0));
-        Joint elbowR(armR, forearmR, vec2(-armR->halfLength, 0)  , vec2(forearmR->halfLength, 0));
-        Joint elbowL(armL, forearmL, vec2(-armL->halfLength, 0)  , vec2(forearmL->halfLength, 0));
-        Joint hipR(hip, legR, vec2(-hip->radius*0.71, -hip->radius*0.71)  , vec2(legR->halfLength, 0));
-        Joint hipL(hip, legL, vec2(hip->radius*0.71,  -hip->radius*0.71)  , vec2(legL->halfLength, 0));
-        Joint kneeR(legR, calfR, vec2(-legR->halfLength, 0)  , vec2(calfR->halfLength, 0));
-        Joint kneeL(legL, calfL, vec2(-legL->halfLength, 0)  , vec2(calfL->halfLength, 0));
+        neck = new Joint(body, head, vec2(body->halfLength, 0.0) , vec2(0.0, -head->halfLength));
+        j0 = new Joint(body, hip, vec2(-body->halfLength, 0.0) , vec2(0, hip->halfLength));
+        j1 = new Joint(body, armR, vec2(body->halfLength*0.34, -body->radius*0.94)  , vec2(armR->halfLength, -0));
+        j2 = new Joint(body, armL, vec2(body->halfLength*0.34, body->radius*0.94)  , vec2(armL->halfLength, -0));
+        elbowR = new Joint(armR, forearmR, vec2(-armR->halfLength, 0)  , vec2(forearmR->halfLength, 0));
+        elbowL = new Joint(armL, forearmL, vec2(-armL->halfLength, 0)  , vec2(forearmL->halfLength, 0));
+        hipR = new Joint(hip, legR, vec2(-hip->radius*0.71, -hip->radius*0.71)  , vec2(legR->halfLength, 0));
+        hipL = new Joint(hip, legL, vec2(hip->radius*0.71,  -hip->radius*0.71)  , vec2(legL->halfLength, 0));
+        kneeR = new Joint(legR, calfR, vec2(-legR->halfLength, 0)  , vec2(calfR->halfLength, 0));
+        kneeL = new Joint(legL, calfL, vec2(-legL->halfLength, 0)  , vec2(calfL->halfLength, 0));
 
-        joints.push_back(neck);
-        joints.push_back(j0);
-        joints.push_back(j1);
-        joints.push_back(j2);
-        joints.push_back(j3);
-        joints.push_back(j4);
-        joints.push_back(elbowR);
-        joints.push_back(elbowL);
-        joints.push_back(hipR);
-        joints.push_back(hipL);
-        joints.push_back(kneeR);
-        joints.push_back(kneeL);
+        joints.push_back(*neck);
+        joints.push_back(*j0);
+        joints.push_back(*j1);
+        joints.push_back(*j2);
+        joints.push_back(*elbowR);
+        joints.push_back(*elbowL);
+        joints.push_back(*hipR);
+        joints.push_back(*hipL);
+        joints.push_back(*kneeR);
+        joints.push_back(*kneeL);
 
         for (Joint& j : joints) {
             vec2 worldA = j.A->worldPoint(j.anchorA_local);
@@ -250,19 +306,65 @@ struct Skeleton {
     }
 };
 
+void key_callback(GLFWwindow* window, int key, int scancode, int action, int mods) {
+    if (action != GLFW_PRESS && action != GLFW_REPEAT) return;
+    if (!sk_ptr) return;
+
+    if (key == GLFW_KEY_UP) {
+        selectedJointIndex = (selectedJointIndex + 1) % sk_ptr->joints.size();
+        auto it = sk_ptr->joints.begin();
+        std::advance(it, selectedJointIndex);
+        cout << "Joint " << selectedJointIndex << " Target: " << it->targetAngle << endl;
+    }
+    if (key == GLFW_KEY_DOWN) {
+        selectedJointIndex = (selectedJointIndex > 0) ? selectedJointIndex - 1 : sk_ptr->joints.size() - 1;
+        auto it = sk_ptr->joints.begin();
+        std::advance(it, selectedJointIndex);
+        cout << "Joint " << selectedJointIndex << " Target: " << it->targetAngle << endl;
+    }
+
+    auto it = sk_ptr->joints.begin();
+    std::advance(it, selectedJointIndex);
+    float angleIncrement = 0.1f; // radians
+
+    if (key == GLFW_KEY_RIGHT) { it->targetAngle += angleIncrement; cout << "Target: " << it->targetAngle << endl; }
+    if (key == GLFW_KEY_LEFT)  { it->targetAngle -= angleIncrement; cout << "Target: " << it->targetAngle << endl; }
+
+    const float MAX_STIFFNESS = 3e6f;
+    if (key == GLFW_KEY_W) {
+        it->stiffness = fmin(it->stiffness + 100000.0f, MAX_STIFFNESS);
+        cout << "Stiffness: " << it->stiffness << endl;
+    }
+    if (key == GLFW_KEY_S) {
+        it->stiffness = fmax(it->stiffness - 20000.0f, 0.0f);
+        cout << "Stiffness: " << it->stiffness << endl;
+    }
+
+    if (key == GLFW_KEY_E) {
+        it->damping += 500.0f;
+        cout << "Damping: " << it->damping << endl;
+    }
+    if (key == GLFW_KEY_D) {
+        it->damping = fmax(it->damping - 500.0f, 0.0f);
+        cout << "Damping: " << it->damping << endl;
+    }
+}
+
 int main () {
     Skeleton* sk = new Skeleton();
+    sk_ptr = sk; // Give global pointer access to the skeleton for the callback
 
     glfwSetCursorPosCallback(engine.window,   Engine::cursor_position_callback);
     glfwSetMouseButtonCallback(engine.window, Engine::mouse_button_callback);
+    glfwSetKeyCallback(engine.window, key_callback);
 
     Bone* dragBone = nullptr;
     vec2 dragOffset;
-    
 
-    float dt = 1.0f/30.0f;
+    float dt = 1/60.0f;
     while (!glfwWindowShouldClose(engine.window)) {
         engine.run();
+
         // -------- SKELETON MECHANICS --------
         // --- Select drag bone ---
         if (mouseDown && !dragBone) {
@@ -277,12 +379,30 @@ int main () {
         } else if (!mouseDown) dragBone = nullptr;
 
         // --- Joint Controls ---
-        if (glfwGetKey(engine.window, GLFW_KEY_A) == GLFW_PRESS) {
-            float torque = 50000.0f; // A large value to have a visible effect
-            for (Joint& j : sk->joints) {
-                // Apply equal and opposite torque to the two bones of the joint
-                j.A->angularVelocity += torque * j.A->invInertia * dt;
-                j.B->angularVelocity -= torque * j.B->invInertia * dt;
+        for (Joint& j : sk->joints) {
+            float currentAngle = j.B->angle - j.A->angle;
+            float error = j.targetAngle - currentAngle;
+
+            // difference in angular velocities (derivative error)
+            float angularVelDiff = j.B->angularVelocity - j.A->angularVelocity;
+
+            // calculate torque using the full PD formula
+            float torque = (j.stiffness * error) - (j.damping * angularVelDiff);
+
+            // 5. clamp torque to prevent explosions.
+            float maxTorque = 5e7f;
+            torque = fmax(-maxTorque, fmin(torque, maxTorque));
+
+            // apply the final torque to the bones
+            j.A->angularVelocity -= torque * j.A->invInertia * dt;
+            j.B->angularVelocity += torque * j.B->invInertia * dt;
+
+            // draw shoulders
+            if (sk->j1 && sk->j2 && j.A == sk->j1->A && j.B == sk->j1->B) {
+                engine.drawCircle(j.A->worldPoint(j.anchorA_local), 7.0f, vec3(1,1,0));
+            }
+            if (sk->j1 && sk->j2 && j.A == sk->j2->A && j.B == sk->j2->B) {
+                engine.drawCircle(j.A->worldPoint(j.anchorA_local), 7.0f, vec3(1,1,0));
             }
         }
 
@@ -291,39 +411,18 @@ int main () {
             b->vel += g * dt; // gravity
             b->oldPos = b->pos;
             b->oldAngle = b->angle;
-
+            
             b->vel*=0.99f; b->angularVelocity*=0.99f; // damping
 
             b->pos += b->vel * dt;
-            checkBorderCollision(b);
             b->angle += b->angularVelocity * dt;
+            checkBorderCollision(b);
         }
 
-        // solve for joints and momentum
+        // solve for joints (keep them together)
         for (int iteration = 0; iteration < 8; iteration++) {
-            // --- Mouse Constraint ---
-            if (dragBone) {
-                vec2 wp = dragBone->worldPoint(dragOffset);
-                vec2 error = mousePos - wp;
-                if (length(error) > 20.0f) error = normalize(error) * 20.0f;
-                vec2 r = wp - dragBone->pos;
-
-                float invMass = dragBone->invMass;
-                float invInertia = dragBone->invInertia;
-
-                float k11 = invMass + invInertia * r.y * r.y;
-                float k12 = -invInertia * r.x * r.y;
-                float k22 = invMass + invInertia * r.x * r.x;
-
-                float det = k11 * k22 - k12 * k12;
-                if (abs(det) > 1e-6f) {
-                    // Solve for impulse P, with a compliance factor to make it feel less rigid
-                    vec2 P = vec2(k22 * error.x - k12 * error.y, -k12 * error.x + k11 * error.y) / det * 0.8f;
-
-                    dragBone->pos += P * invMass;
-                    dragBone->angle += invInertia * (r.x * P.y - r.y * P.x);
-                }
-            }
+            // --- mouse dragging ---
+            if (dragBone)  dragBone->pos = mousePos;
 
             for (Joint& j : sk->joints) {
                 // world anchors
@@ -348,10 +447,7 @@ int main () {
                 if (abs(det) < 1e-6f) continue;
 
                 // Solve for impulse P
-                vec2 P{
-                    (k22*error.x - k12*error.y)/det,
-                    (-k12*error.x + k11*error.y)/det
-                };
+                vec2 P{ (k22*error.x - k12*error.y)/det, (-k12*error.x + k11*error.y)/det };
 
                 // Apply correction to position and angle (torque effect)
                 j.A->pos += P * j.A->invMass;
@@ -361,11 +457,20 @@ int main () {
             }
         }
 
-        // keep bones together & draw
+        // Update velocities and draw
         for (Bone* b : sk->bones) {
             b->vel = (b->pos - b->oldPos) / dt;
             b->angularVelocity = (b->angle - b->oldAngle) / dt;
             b->draw();
+        }
+
+        // Draw UI for selected joint
+        if (!sk->joints.empty()) {
+            auto it = sk->joints.begin();
+            std::advance(it, selectedJointIndex);
+            vec2 jointPos = it->A->worldPoint(it->anchorA_local);
+            engine.drawCircle(jointPos, 4.0f, vec3(1,0,0));
+
         }
 
         glfwSwapBuffers(engine.window);
