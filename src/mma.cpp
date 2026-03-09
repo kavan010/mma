@@ -9,6 +9,13 @@
 #include <cstdlib>
 #include <list>
 #include <vector>
+// Add these for Windows
+#include <winsock2.h>
+#include <ws2tcpip.h>
+
+// Note: You must link the library 'ws2_32' when compiling
+#pragma comment(lib, "ws2_32.lib")
+
 using namespace glm;
 using namespace std;
 
@@ -361,9 +368,32 @@ int main () {
     Bone* dragBone = nullptr;
     vec2 dragOffset;
 
+
+    // --- Socket Setup ---
+    WSADATA wsaData; WSAStartup(MAKEWORD(2, 2), &wsaData); SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    sockaddr_in serverAddr; serverAddr.sin_family = AF_INET; serverAddr.sin_port = htons(5005); serverAddr.sin_addr.s_addr = INADDR_ANY;
+    bind(sock, (sockaddr*)&serverAddr, sizeof(serverAddr));
+    u_long mode = 1; ioctlsocket(sock, FIONBIO, &mode);
+    float recvBuffer[20];
+
+
+
     float dt = 1/60.0f;
     while (!glfwWindowShouldClose(engine.window)) {
         engine.run();
+
+        // --- Receive Data from Python ---
+int bytesRead = recv(sock, (char*)recvBuffer, sizeof(recvBuffer), 0);
+if (bytesRead > 0) {
+    int jointIdx = 0;
+    for (Joint& j : sk->joints) {
+        if (jointIdx * 2 + 1 < 20) {
+            j.targetAngle = recvBuffer[jointIdx * 2];
+            j.stiffness   = recvBuffer[jointIdx * 2 + 1];
+            jointIdx++;
+        }
+    }
+}
 
         // -------- SKELETON MECHANICS --------
         // --- Select drag bone ---
