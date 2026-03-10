@@ -1,32 +1,38 @@
-import socket
-import struct
-import random
-import time
+import socket, struct, random
 
-# Configuration
-UDP_IP = "127.0.0.1"
-UDP_PORT = 5005
-NUM_JOINTS = 10 # Your mma.cpp has 10 joints
+IP, SEND_PORT, RECV_PORT = "127.0.0.1", 5005, 5006
+J, B, V = 10, 11, 6
+SIZE = B * V * 4
 
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+print(f"Sending random physics data to {IP}:{SEND_PORT}")
 
-print(f"Sending random physics data to {UDP_IP}:{UDP_PORT}...")
+send = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+recv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+recv.bind((IP, RECV_PORT))
+recv.setblocking(False)
+recv.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024)
+
+print(f"Listening for observation data on {IP}:{RECV_PORT}")
 
 try:
     while True:
-        # Create a list of (targetAngle, stiffness) for each joint
-        # targetAngle: -3.14 to 3.14 | stiffness: 0 to 1,000,000
-        data_to_send = []
-        for _ in range(NUM_JOINTS):
-            data_to_send.append(random.uniform(-3.14, 3.14)) # targetAngle
-            data_to_send.append(random.uniform(0, 1000000.0)) # stiffness
+        vals = [v for _ in range(J) for v in (random.uniform(-3.14,3.14), random.uniform(0,1e6))]
+        send.sendto(struct.pack('f'*len(vals), *vals), (IP, SEND_PORT))
 
-        # Pack into binary format: 'f' is a 4-byte float
-        # 'f' * (NUM_JOINTS * 2) creates a string like 'ffff...'
-        packet = struct.pack('f' * (NUM_JOINTS * 2), *data_to_send)
-        
-        sock.sendto(packet, (UDP_IP, UDP_PORT))
-        
-        time.sleep(1/60.0) # Match 60 FPS
+        latest = None
+        while True:
+            try: latest,_ = recv.recvfrom(SIZE)
+            except BlockingIOError: break
+
+        if latest and len(latest)==SIZE:
+            state = struct.unpack('f'*(B*V), latest)
+            body_x, body_y = state[:2]
+            # print(f"Body position: ({body_x:.2f}, {body_y:.2f})")
+
 except KeyboardInterrupt:
-    print("Stopped by user.")
+    print("\nStopped by user.")
+finally:
+    print("Closing sockets.")
+    send.close()
+    recv.close()
