@@ -1,38 +1,45 @@
-import socket, struct, random
+import torch
+import torch.nn as nn
+import socket
+import struct
 
-IP, SEND_PORT, RECV_PORT = "127.0.0.1", 5005, 5006
-J, B, V = 10, 11, 6
-SIZE = B * V * 4
+anglesGood = torch.tensor([5, 4.95, 3, 4, 0, 0, 1, 2, 0, 0], dtype=torch.float32)
+stiffGood  = torch.tensor([1, 1, 1, 1, 1, 1, 1, 1, 1, 1],    dtype=torch.float32)
+target     = torch.cat([anglesGood, stiffGood])
 
-print(f"Sending random physics data to {IP}:{SEND_PORT}")
+class UDP:
+    def __init__(self, ip, recv_port, send_port):
+        self.recv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.recv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.recv_sock.bind((ip, recv_port))
+        self.send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.send_addr = (ip, send_port)
 
-send = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    def receive(self, num_floats=20):
+        data, _ = self.recv_sock.recvfrom(num_floats * 4)
+        return struct.unpack(f"{num_floats}f", data)
 
-recv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-recv.bind((IP, RECV_PORT))
-recv.setblocking(False)
-recv.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024)
+    def send(self, actions):
+        self.send_sock.sendto(struct.pack(f"{len(actions)}f", *actions), self.send_addr)
 
-print(f"Listening for observation data on {IP}:{RECV_PORT}")
+udp = UDP("127.0.0.1", 5006, 5005)
 
-try:
-    while True:
-        vals = [v for _ in range(J) for v in (random.uniform(-3.14,3.14), random.uniform(0,1e6))]
-        send.sendto(struct.pack('f'*len(vals), *vals), (IP, SEND_PORT))
+net = nn.Sequential(
+    nn.Linear(20, 128), nn.Tanh(),
+    nn.Linear(128, 128), nn.Tanh(),
+    nn.Linear(128, 20)
+)
+net.load_state_dict(torch.load("model.pt"))
+net.eval()
 
-        latest = None
-        while True:
-            try: latest,_ = recv.recvfrom(SIZE)
-            except BlockingIOError: break
+step = 0
+while True:
+    state     = torch.tensor(udp.receive(), dtype=torch.float32).unsqueeze(0)
+    vals      = (state + net(state)).squeeze().detach()
+    udp.send(vals.tolist())
 
-        if latest and len(latest)==SIZE:
-            state = struct.unpack('f'*(B*V), latest)
-            body_x, body_y = state[:2]
-            # print(f"Body position: ({body_x:.2f}, {body_y:.2f})")
-
-except KeyboardInterrupt:
-    print("\nStopped by user.")
-finally:
-    print("Closing sockets.")
-    send.close()
-    recv.close()
+    if step % 10 == 0:
+        print(f"\nstep {step:6d}")
+        for i in range(10):
+            print(f"  joint {i} | angle {vals[i]:.4f} (target {target[i]:.2f}) | stiff {vals[i+10]:.4f} (target {target[i+10]:.2f})")
+    step += 1

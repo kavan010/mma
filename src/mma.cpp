@@ -1,44 +1,33 @@
 #include <GL/glew.h>
 #include <GLFW/glfw3.h>
 #include <glm/glm.hpp>
-#include <glm/gtc/matrix_transform.hpp>
-#include <glm/gtc/type_ptr.hpp>
 #include <glm/gtc/constants.hpp>
 #include <iostream>
 #include <cmath>
 #include <cstdlib>
 #include <list>
 #include <vector>
-// Add these for Windows
 #include <winsock2.h>
 #include <ws2tcpip.h>
-
-// Note: You must link the library 'ws2_32' when compiling
 #pragma comment(lib, "ws2_32.lib")
+using namespace glm; using namespace std;
 
-using namespace glm;
-using namespace std;
 
-// --- constants ----
-const vec2 g(0.0f, -194.0f);
-
-vec2 mousePos; bool mouseDown = false;
-
+// ------------------------ Engine & Constants ------------------------
+vec2 g(0.0f, -980.6f);
 struct Engine {
     GLFWwindow* window;
     int WIDTH = 800, HEIGHT = 600;
 
     Engine () {
         if (!glfwInit()) {
-            cerr << "Failed to initialize GLFW" << endl;
-            exit(EXIT_FAILURE);
+            cerr << "Failed to initialize GLFW" << endl; exit(EXIT_FAILURE);
         }
 
         window = glfwCreateWindow(WIDTH, HEIGHT, "2D atom sim by kavan", nullptr, nullptr);
         if (!window) {
             cerr << "Failed to create GLFW window" << endl;
-            glfwTerminate();
-            exit(EXIT_FAILURE);
+            glfwTerminate(); exit(EXIT_FAILURE);
         }
 
         glfwMakeContextCurrent(window);
@@ -46,30 +35,14 @@ struct Engine {
         glfwGetFramebufferSize(window, &fbWidth, &fbHeight);
         glViewport(0, 0, fbWidth, fbHeight);
     }
-
     void run() {
         glClear(GL_COLOR_BUFFER_BIT);
         glMatrixMode(GL_PROJECTION);
         glLoadIdentity();
-
-        double halfWidth = WIDTH / 2.0, halfHeight = HEIGHT / 2.0;
-        glOrtho(-halfWidth, halfWidth, -halfHeight, halfHeight, -1.0, 1.0);
-
-        glMatrixMode(GL_MODELVIEW);
-        glLoadIdentity();
+        glOrtho(0.0, (double)WIDTH, 0.0, (double)HEIGHT, -1.0, 1.0);
     }
 
-    // ------ Callbacks ------
-    static void cursor_position_callback(GLFWwindow* window, double xpos, double ypos) {
-        int width, height;
-        glfwGetWindowSize(window, &width, &height);
-        mousePos = vec2(xpos - width/2.0, height/2.0 - ypos);
-    }
-    static void mouse_button_callback(GLFWwindow* window, int button, int action, int mods) {
-        if (button == GLFW_MOUSE_BUTTON_LEFT) {
-            mouseDown = (action == GLFW_PRESS);
-        }
-    }
+    // ------ Helper Functions ------
     float cross(vec2 a, vec2 b) {
         return a.x*b.y - a.y*b.x;
     }
@@ -83,366 +56,361 @@ struct Engine {
             }
         glEnd();
     }
+
 };
 Engine engine;
 
-// --- Globals for UI ---
-int selectedJointIndex = 0;
-struct Skeleton;
-Skeleton* sk_ptr = nullptr;
-bool train_mode = true;
+vec2 mousePos; bool mouseDown = false;
 
-
-// --- structs ---
-struct Bone {
-    vec2 pos; float angle;
-    float halfLength, radius;
-
-    vec2 vel; // linear
-    float angularVelocity, mass, inertia;
-    float invMass, invInertia;
-
-    vec2 oldPos; float oldAngle;
-
-    vec2 initialPos;
-    float initialAngle;
-
-    Bone (vec2 p, float a, float l, float r, float m) : pos(p), angle(a), halfLength(l), radius(r), mass(m), initialPos(p), initialAngle(a) { 
-
-        vel = vec2(0.0f, 0.0f);
-        angularVelocity = 0.0f;
-        // Use a box approximation for inertia: I = 1/12 * m * (h^2 + w^2).
-        // The simple rod formula (1/12 * m * h^2) is unstable for "fat" objects like the head
-        // because it ignores the radius, making them too easy to spin.
-        inertia = (1.0f/12.0f) * m * (pow(halfLength*2.0f, 2) + pow(radius*2.0f, 2));
-        invMass = 1.0f / m;
-        invInertia = 1.0f / inertia;
-    }
-
-    // Compute the world-space point at local coordinate (x along bone, y perp)
-    vec2 worldPoint(vec2 local) const {
-        vec2 right = vec2(cos(angle), sin(angle));
-        vec2 up = vec2(-sin(angle), cos(angle));
-        return pos + right * local.x + up * local.y;
-    }
-
-    void draw() {
-        // direction of the bone
-        vec2 dir(cos(angle), sin(angle));
-
-        // endpoints derived from center + orientation
-        vec2 p1 = pos - dir * halfLength;
-        vec2 p2 = pos + dir * halfLength;
-
-        float len = glm::length(p2 - p1);
-        if (len == 0) return;
-
-        vec2 dirN = glm::normalize(p2 - p1);
-        vec2 right(-dirN.y, dirN.x);
-
-        // circle centers
-        vec2 c1 = p1 + dirN * radius;
-        vec2 c2 = p2 - dirN * radius;
-
-        vec2 rOffset = right * radius;
-
-        glColor4f(1,1,1,1);
-
-        // rectangle body
-        glBegin(GL_QUADS);
-            glVertex2f((c2 + rOffset).x, (c2 + rOffset).y);
-            glVertex2f((c2 - rOffset).x, (c2 - rOffset).y);
-            glVertex2f((c1 - rOffset).x, (c1 - rOffset).y);
-            glVertex2f((c1 + rOffset).x, (c1 + rOffset).y);
-        glEnd();
-
-        // circle 1
-        glBegin(GL_TRIANGLE_FAN);
-            glVertex2f(c1.x, c1.y);
-            for (int i = 0; i <= 20; i++) {
-                float a = (i / 20.0f) * 2.0f * glm::pi<float>();
-                glVertex2f(c1.x + cos(a)*radius, c1.y + sin(a)*radius);
-            }
-        glEnd();
-
-        // circle 2
-        glBegin(GL_TRIANGLE_FAN);
-            glVertex2f(c2.x, c2.y);
-            for (int i = 0; i <= 20; i++) {
-                float a = (i / 20.0f) * 2.0f * glm::pi<float>();
-                glVertex2f(c2.x + cos(a)*radius, c2.y + sin(a)*radius);
-            }
-        glEnd();
-    }
-};
-
-struct Joint {
-    Bone* A;
-    Bone* B;
-    vec2 anchorA_local;   // anchor in local coordinates of A
-    vec2 anchorB_local;   // anchor in local coordinates of B
-
-    // --- PD Controller Properties ---
-    float targetAngle = 0.0f;
-    float stiffness = 2.5e6f;    // k_p: How strongly it tries to reach the target angle.
-    float damping = 10000.0f;   // k_d: How much it resists motion to prevent overshoot.
-
-    Joint(Bone* a, Bone* b, vec2 anchorA, vec2 anchorB) : A(a), B(b), anchorA_local(anchorA), anchorB_local(anchorB) {
-        // Set initial target angle to the current relative angle so it's not floppy at the start
-        targetAngle = B->angle - A->angle;
-    }
-};
-
-
-
-// --- Physics ---
-void checkBorderCollision(Bone* b) {
-    float halfWidth = engine.WIDTH / 2.0f;
-    float halfHeight = engine.HEIGHT / 2.0f;
-    float floorLevel = -halfHeight + 50.0f;
-
-    vec2 dir(cos(b->angle), sin(b->angle));
-    vec2 offset = dir * b->halfLength;
-    vec2 p1 = b->pos - offset;
-    vec2 p2 = b->pos + offset;
-
-    float minX = fmin(p1.x, p2.x) - b->radius;
-    float maxX = fmax(p1.x, p2.x) + b->radius;
-    float minY = fmin(p1.y, p2.y) - b->radius;
-    float maxY = fmax(p1.y, p2.y) + b->radius;
-
-    if (minX < -halfWidth) {
-        float fix = -halfWidth - minX;
-        b->pos.x += fix;
-        // Kill velocity normal to the wall to prevent bouncing (inelastic collision)
-        b->oldPos.x = b->pos.x;
-    }
-    if (maxX >  halfWidth) {
-        float fix = halfWidth - maxX;
-        b->pos.x += fix;
-        // Kill velocity normal to the wall to prevent bouncing (inelastic collision)
-        b->oldPos.x = b->pos.x;
-    }
-    if (minY < floorLevel) {
-        float fix = floorLevel - minY;
-        b->pos.y += fix;
-        // Kill velocity normal to the wall to prevent bouncing (inelastic collision)
-        b->oldPos.y = b->pos.y;
-    }
-    if (maxY > halfHeight) {
-        float fix = halfHeight - maxY;
-        b->pos.y += fix;
-        // Kill velocity normal to the wall to prevent bouncing (inelastic collision)
-        b->oldPos.y = b->pos.y;
-    }
+// ------------------------ Bodies & Physics ------------------------
+vec2 rotate(vec2 v, float a) {
+    float c = cos(a), s = sin(a);
+    return vec2(c*v.x - s*v.y, s*v.x + c*v.y);
+}
+float cross(vec2 a, vec2 b) {
+    return a.x*b.y - a.y*b.x;
+}
+vec2 cross(float s, vec2 v) {
+    return vec2(-s*v.y, s*v.x);
 }
 
+struct Bone {
+    vec2 pos, vel;
+    float angle, angVel;
+    float halfLength, radius, mass, inertia, invMass, invInertia;
+    vec2 force = vec2(0.0f);
+    float torque = 0.0f;
+    bool dragged = false;
+
+    Bone(vec2 p,float a,float l,float r,float m) : pos(p), vel(0), angle(a), angVel(0), halfLength(l), radius(r), mass(m) {
+        float L=l*2, W=r*2;
+        inertia=(m*(L*L+W*W))/12.f;
+        invMass=1.f/m;
+        invInertia=1.f/inertia;
+    }
+    vec2 worldPoint(vec2 local) const {
+        float c=cos(angle), s=sin(angle);
+        return pos + vec2(c*local.x - s*local.y, s*local.x + c*local.y);
+    }
+    void draw() {
+        vec2 dir(cos(angle),sin(angle));
+        vec2 p1=pos-dir*halfLength, p2=pos+dir*halfLength;
+
+        if(glm::length(p2-p1)*glm::length(p2-p1)==0) return;
+
+        vec2 d=glm::normalize(p2-p1), r=vec2(-d.y,d.x)*radius;
+        vec2 c1=p1+d*radius, c2=p2-d*radius;
+
+        // Draw Rectangle Portion
+        glColor4f(1,1,1,1);
+        glBegin(GL_QUADS);
+            glVertex2f((c2+r).x,(c2+r).y);
+            glVertex2f((c2-r).x,(c2-r).y);
+            glVertex2f((c1-r).x,(c1-r).y);
+            glVertex2f((c1+r).x,(c1+r).y);
+        glEnd();
+
+        // Draw End Caps
+        for(vec2 c:{c1,c2}){
+            glBegin(GL_TRIANGLE_FAN);
+            glVertex2f(c.x,c.y);
+            for(int i=0;i<=20;i++){
+                float a=i/20.f*2*glm::pi<float>();
+                glVertex2f(c.x+cos(a)*radius,c.y+sin(a)*radius);
+            }
+            glEnd();
+        }
+    }
+};
+struct Joint {
+    Bone* A, *B; // bones conected by this joint
+    vec2 anchorA_local, anchorB_local; // local positions the joint connects to
+    float maxTorque = 1e5f;
+
+    // --- Controller Properties ---
+    float targetAngle = 0.0f;
+    float stiffness = 1.0f;
+
+    Joint(Bone* a, Bone* b, vec2 anchorA, vec2 anchorB, float targetAngle=3.14f) : A(a), B(b), anchorA_local(anchorA), anchorB_local(anchorB), targetAngle(targetAngle) { }
+
+    void solve(float dt) {
+        Bone* A = this->A; Bone* B = this->B;
+
+        vec2 rA = rotate(anchorA_local, A->angle), rB = rotate(anchorB_local, B->angle);
+        vec2 pA = A->pos + rA, pB = B->pos + rB;
+
+        // position error
+        vec2 C = pB - pA;
+        // anchor velocities
+        vec2 vA = A->vel + cross(A->angVel, rA);
+        vec2 vB = B->vel + cross(B->angVel, rB);
+
+        vec2 relVel = vB - vA;
+
+        // --- Baumgarte stabilization ---
+        float beta = 0.8f;
+        vec2 bias = (beta / dt) * C;
+        vec2 Cdot = relVel + bias;
+
+        float k11 = A->invMass + B->invMass + A->invInertia*rA.y*rA.y + B->invInertia*rB.y*rB.y;
+        float k12 = -A->invInertia*rA.x*rA.y - B->invInertia*rB.x*rB.y;
+        float k21 = k12;
+        float k22 = A->invMass + B->invMass + A->invInertia*rA.x*rA.x + B->invInertia*rB.x*rB.x;
+
+        float det = k11*k22 - k12*k21;
+        if(det == 0) return;
+
+        float invDet = 1.0f / det;
+
+        vec2 impulse;
+        impulse.x = -( k22*Cdot.x - k12*Cdot.y) * invDet;
+        impulse.y = -(-k21*Cdot.x + k11*Cdot.y) * invDet;
+
+        A->vel -= impulse * A->invMass;
+        B->vel += impulse * B->invMass;
+
+        A->angVel -= cross(rA, impulse) * A->invInertia;
+        B->angVel += cross(rB, impulse) * B->invInertia;
+    }
+    void applyTorque(float dt) {
+        float angle   = B->angle - A->angle;
+        float angVel  = B->angVel - A->angVel;
+        float error   = targetAngle - angle;
+
+        float k = stiffness * maxTorque;
+        float d = 2.0f * sqrt(k * (A->inertia + B->inertia));  // critical damping
+
+        float torque  = k * error - d * angVel;
+
+        // clamp to maxTorque so it cant explode
+        torque = glm::clamp(torque, -maxTorque, maxTorque);
+
+        // convert to impulse scaled by dt
+        float impulse = torque * dt;
+
+        A->angVel -= impulse * A->invInertia;
+        B->angVel += impulse * B->invInertia;
+    }
+};
 
 struct Skeleton {
-    list<Bone*> bones;
-    list<Joint> joints;
+    vector<Bone*> bones;
+    vector<Joint> joints;
 
-    Bone* body; Bone* head; Bone* hip;
-    Bone* armR; Bone* armL;
-    Bone* forearmR; Bone* forearmL;
-    Bone* legR; Bone* legL;
-    Bone* calfR; Bone* calfL;
+    Bone *body,*head,*hip,*armR,*armL,*forearmR,*forearmL,*legR,*legL,*calfR,*calfL;
 
-    Joint* neck; Joint* j0; Joint* j1; Joint* j2;
-    Joint* elbowR; Joint* elbowL;
-    Joint* hipR; Joint* hipL;
-    Joint* kneeR; Joint* kneeL;
-
-    Skeleton() {
-        init();
-    }
+    Skeleton(){ init(); }
 
     void init() {
-                        // center     angle length radius
-        body      = new Bone(vec2(0, -120),       3.14f/2.0f,   25.0f, 25.0f,    60.0f); // Torso
-        head       = new Bone(vec2(0, -300),        0.0,          15.0f, 15.0f,    5.0f);  // Head
-        hip       = new Bone(vec2(0, -300),         0.0,          15.0f, 15.0f,    40.0f);
-        armR      = new Bone(vec2(-150, -350),     3.14,   20.0f, 7.0f,     15.0f);
-        armL      = new Bone(vec2(150, -350),      0.0,   20.0f, 7.0f,     15.0f);
-        forearmR      = new Bone(vec2(-150, -350), 3.14f/2.0f,   20.0f, 7.0f,     10.0f);
-        forearmL      = new Bone(vec2(150, -350),  3.14f/2.0f,   20.0f, 7.0f,     10.0f);
-        legR      = new Bone(vec2(-150, -350),     3.14f/4,   25.0f, 10.0f,    20.0f);
-        legL      = new Bone(vec2(150, -350),      3.14f-3.14f/4,   25.0f, 10.0f,    20.0f);
-        calfR      = new Bone(vec2(-150, -100),    3.14f/2.0f,   20.0f, 7.0f,     15.0f);
-        calfL      = new Bone(vec2(150, -100),     3.14f/2.0f,   20.0f, 7.0f,     15.0f);
-        
+        // ---- Bones ----
+        body     = new Bone({400,200},1.45786f,25,25,24.0);
+        head     = new Bone({400,200},6.45816f,15,15,6.0);
+        hip      = new Bone({400,200},6.35747f,15,15,10.0);
 
-        bones.push_back(body);
-        bones.push_back(head);
-        bones.push_back(hip);
-        bones.push_back(armR);
-        bones.push_back(armL);
-        bones.push_back(forearmR);
-        bones.push_back(forearmL);
-        bones.push_back(legR);
-        bones.push_back(legL);
-        bones.push_back(calfR);
-        bones.push_back(calfL);
+        armR     = new Bone({250,200},4.44994f,20,7,20.5);
+        armL     = new Bone({550,200},5.48231f,20,7,20.5);
 
-                //  boneA     boneB    anchorA_local                  anchorB_local
-        neck = new Joint(body, head, vec2(body->halfLength, 0.0) , vec2(0.0, -head->halfLength));
-        j0 = new Joint(body, hip, vec2(-body->halfLength, 0.0) , vec2(0, hip->halfLength));
-        j1 = new Joint(body, armR, vec2(body->halfLength*0.34, -body->radius*0.94)  , vec2(armR->halfLength, -0));
-        j2 = new Joint(body, armL, vec2(body->halfLength*0.34, body->radius*0.94)  , vec2(armL->halfLength, -0));
-        elbowR = new Joint(armR, forearmR, vec2(-armR->halfLength, 0)  , vec2(forearmR->halfLength, 0));
-        elbowL = new Joint(armL, forearmL, vec2(-armL->halfLength, 0)  , vec2(forearmL->halfLength, 0));
-        hipR = new Joint(hip, legR, vec2(-hip->radius*0.71, -hip->radius*0.71)  , vec2(legR->halfLength, 0));
-        hipL = new Joint(hip, legL, vec2(hip->radius*0.71,  -hip->radius*0.71)  , vec2(legL->halfLength, 0));
-        kneeR = new Joint(legR, calfR, vec2(-legR->halfLength, 0)  , vec2(calfR->halfLength, 0));
-        kneeL = new Joint(legL, calfL, vec2(-legL->halfLength, 0)  , vec2(calfL->halfLength, 0));
+        forearmR = new Bone({250,200},4.44997f,20,7,10.5);
+        forearmL = new Bone({550,200},5.48231f,20,7,10.5);
 
-        joints.push_back(*neck);
-        joints.push_back(*j0);
-        joints.push_back(*j1);
-        joints.push_back(*j2);
-        joints.push_back(*elbowR);
-        joints.push_back(*elbowL);
-        joints.push_back(*hipR);
-        joints.push_back(*hipL);
-        joints.push_back(*kneeR);
-        joints.push_back(*kneeL);
+        legR     = new Bone({250,200},7.3253f,25,10,7.0);
+        legL     = new Bone({550,200},8.36471f,25,10,7.0);
 
-        for (Joint& j : joints) {
-            vec2 worldA = j.A->worldPoint(j.anchorA_local);
-            vec2 worldB = j.B->worldPoint(j.anchorB_local);
+        calfR    = new Bone({250,200},7.32835f,20,7,3.5);
+        calfL    = new Bone({550,200},8.36382f,20,7,3.5);
 
-            vec2 error = worldA - worldB;
+        bones = {body,head,hip,armR,armL,forearmR,forearmL,legR,legL,calfR,calfL};
 
-            j.B->pos += error;
-        }
+        // Joints 
+        joints.push_back(Joint(body,head,{body->halfLength,0},{0,-head->halfLength}, 5.0f));
+        joints.push_back(Joint(body,hip,{-body->halfLength,0},{0,hip->halfLength}, 4.95f));
 
-        // After the initial joint placement, save this pose as the "reset" state.
-        for (Bone* b : bones) {
-            b->initialPos = b->pos;
-            b->initialAngle = b->angle;
+        joints.push_back(Joint(body,armR,{body->halfLength*0.34f,-body->radius*0.94f},{armR->halfLength,0},3.0f));
+        joints.push_back(Joint(body,armL,{body->halfLength*0.34f, body->radius*0.94f},{armL->halfLength,0},4.0f));
+
+        joints.push_back(Joint(armR,forearmR,{-armR->halfLength,0},{forearmR->halfLength,0},0.0f));
+        joints.push_back(Joint(armL,forearmL,{-armL->halfLength,0},{forearmL->halfLength,0},0.0f));
+
+        joints.push_back(Joint(hip,legR,{-hip->radius*0.71f,-hip->radius*0.71f},{legR->halfLength,0},1.0f));
+        joints.push_back(Joint(hip,legL,{ hip->radius*0.71f,-hip->radius*0.71f},{legL->halfLength,0},2.0f));
+
+        joints.push_back(Joint(legR,calfR,{-legR->halfLength,0},{calfR->halfLength,0},0.0f));
+        joints.push_back(Joint(legL,calfL,{-legL->halfLength,0},{calfL->halfLength,0},0.0f));
+
+        // Initial constraint alignment
+        for(auto& j : joints){
+            vec2 err = j.A->worldPoint(j.anchorA_local) - j.B->worldPoint(j.anchorB_local);
+            j.B->pos += err;
         }
     }
-    void reset() {
-            // Reset all bones to their initial positions, angles, and zero velocities.
-            for (Bone* b : bones) {
-                b->pos = b->initialPos;
-                b->angle = b->initialAngle;
-                b->vel = vec2(0.0f, 0.0f);
-                b->angularVelocity = 0.0f;
-                b->oldPos = b->pos;
-                b->oldAngle = b->angle;
+
+    void checkBorderCollision(Bone* b) {
+        float restitution = 0.2f, slop = 0.01f, percent = 0.8f, friction = 0.8f;
+
+        vec2 dir(cos(b->angle), sin(b->angle));
+        vec2 offset = dir * b->halfLength;
+        vec2 points[2] = { b->pos - offset, b->pos + offset };
+
+        for (vec2 contact : points) {
+            vec2 normal;
+            float penetration = 0.0f;
+            bool collided = false;
+
+            if (contact.x < b->radius) {
+                normal = vec2(1,0);
+                penetration = b->radius - contact.x;
+                collided = true;
             }
-            // Also reset the target angle for each joint to match the new pose.
-            for (Joint& j : joints) {
-                j.targetAngle = j.B->angle - j.A->angle;
+            else if (contact.x > engine.WIDTH - b->radius) {
+                normal = vec2(-1,0);
+                penetration = contact.x - (engine.WIDTH - b->radius);
+                collided = true;
             }
+            else if (contact.y < b->radius) {
+                normal = vec2(0,1);
+                penetration = b->radius - contact.y;
+                collided = true;
+            }
+            else if (contact.y > engine.HEIGHT - b->radius) {
+                normal = vec2(0,-1);
+                penetration = contact.y - (engine.HEIGHT - b->radius);
+                collided = true;
+            }
+            if (!collided) continue;
+
+            // deal with the contacted point
+            vec2 r = contact - b->pos;
+
+            // velocity at contact
+            vec2 vel = b->vel + cross(b->angVel, r);
+
+            float velAlongNormal = dot(vel, normal);
+            if (velAlongNormal > 0) continue;
+
+            float rCrossN = cross(r, normal);
+            float denom = b->invMass + (rCrossN * rCrossN) * b->invInertia;
+            if (denom == 0) continue;
+
+            float jn = -(1.0f + restitution) * velAlongNormal;
+            jn /= denom;
+
+            vec2 impulse = normal * jn;
+            b->vel += impulse * b->invMass;
+            b->angVel += cross(r, impulse) * b->invInertia;
+
+            b->vel.x *= friction;
+            b->vel.y *= 0.8f;
+
+            // --- 3. Positional Correction ---
+            vec2 correction = normal * percent * fmax(penetration - slop, 0.0f);
+            b->pos += correction;
+        }
     }
 };
 
-void key_callback(GLFWwindow* window, int key, int scancode, int action, int mods) {
-    if (action != GLFW_PRESS && action != GLFW_REPEAT) return;
-    if (!sk_ptr) return;
+// ------------------------ File Connections ------------------------
+struct Data {
+    // Sockets
+    WSADATA w;
+    SOCKET sock, sendSock;
+    sockaddr_in server, python;
 
-    if (key == GLFW_KEY_R) {
-        sk_ptr->reset();
-        cout << "Skeleton reset." << endl;
+    float recvBuffer[20], stateBuffer[20];
+    int frameCount=0, skipAmount=5;
+    float dt=1/60.f;
+
+    Data() {
+        WSAStartup(MAKEWORD(2,2), &w);
+        sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        sendSock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        
+        server.sin_family = AF_INET;
+        server.sin_port = htons(5005);
+        server.sin_addr.S_un.S_addr = INADDR_ANY;
+        
+        python.sin_family = AF_INET;
+        python.sin_port = htons(5006);
+        inet_pton(AF_INET, "127.0.0.1", &python.sin_addr);
+        
+        bind(sock, (sockaddr*)&server, sizeof(server));
+        u_long mode = 1;
+        ioctlsocket(sock, FIONBIO, &mode);
     }
-
-    if (key == GLFW_KEY_UP) {
-        selectedJointIndex = (selectedJointIndex + 1) % sk_ptr->joints.size();
-        auto it = sk_ptr->joints.begin();
-        std::advance(it, selectedJointIndex);
-        cout << "Joint " << selectedJointIndex << " Target: " << it->targetAngle << endl;
-    }
-    if (key == GLFW_KEY_DOWN) {
-        selectedJointIndex = (selectedJointIndex > 0) ? selectedJointIndex - 1 : sk_ptr->joints.size() - 1;
-        auto it = sk_ptr->joints.begin();
-        std::advance(it, selectedJointIndex);
-        cout << "Joint " << selectedJointIndex << " Target: " << it->targetAngle << endl;
-    }
-
-    auto it = sk_ptr->joints.begin();
-    std::advance(it, selectedJointIndex);
-    float angleIncrement = 0.1f; // radians
-
-    if (key == GLFW_KEY_RIGHT) { it->targetAngle += angleIncrement; cout << "Target: " << it->targetAngle << endl; }
-    if (key == GLFW_KEY_LEFT)  { it->targetAngle -= angleIncrement; cout << "Target: " << it->targetAngle << endl; }
-
-    const float MAX_STIFFNESS = 3e6f;
-    if (key == GLFW_KEY_W) {
-        it->stiffness = fmin(it->stiffness + 100000.0f, MAX_STIFFNESS);
-        cout << "Stiffness: " << it->stiffness << endl;
-    }
-    if (key == GLFW_KEY_S) {
-        it->stiffness = fmax(it->stiffness - 20000.0f, 0.0f);
-        cout << "Stiffness: " << it->stiffness << endl;
-    }
-
-    if (key == GLFW_KEY_E) {
-        it->damping += 500.0f;
-        cout << "Damping: " << it->damping << endl;
-    }
-    if (key == GLFW_KEY_D) {
-        it->damping = fmax(it->damping - 500.0f, 0.0f);
-        cout << "Damping: " << it->damping << endl;
-    }
-    if (key == GLFW_KEY_T) {
-        train_mode = !train_mode;
-        cout << "Train Mode: " << (train_mode ? "ON" : "OFF") << endl;
-    }
-}
-
-int main () {
-    Skeleton* sk = new Skeleton();
-    sk_ptr = sk; // Give global pointer access to the skeleton for the callback
-
-    glfwSetCursorPosCallback(engine.window,   Engine::cursor_position_callback);
-    glfwSetMouseButtonCallback(engine.window, Engine::mouse_button_callback);
-    glfwSetKeyCallback(engine.window, key_callback);
-
-    Bone* dragBone = nullptr;
-    vec2 dragOffset;
-
-
-    // --- Socket Setup ---
-    WSADATA wsaData; WSAStartup(MAKEWORD(2, 2), &wsaData); SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    sockaddr_in serverAddr; serverAddr.sin_family = AF_INET; serverAddr.sin_port = htons(5005); serverAddr.sin_addr.s_addr = INADDR_ANY;
-    bind(sock, (sockaddr*)&serverAddr, sizeof(serverAddr));
-    u_long mode = 1; ioctlsocket(sock, FIONBIO, &mode);
-    float recvBuffer[20];
-
-    // --- Observation Socket (Sending to Python) ---
-    SOCKET sendSock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    sockaddr_in pythonAddr;
-    pythonAddr.sin_family = AF_INET;
-    pythonAddr.sin_port = htons(5006); // Python will listen here
-    inet_pton(AF_INET, "127.0.0.1", &pythonAddr.sin_addr);
-
-    // 11 bones * 6 values (x, y, vx, vy, angle, angularVel) = 66 floats
-    float stateBuffer[66];
-
-
-
-    float dt = 1/60.0f;
-    while (!glfwWindowShouldClose(engine.window)) {
-        engine.run();
-
-        // --- Receive Data from Python ---
-        int bytesRead = recv(sock, (char*)recvBuffer, sizeof(recvBuffer), 0);
-        if (bytesRead > 0) {
-            int jointIdx = 0;
-            for (Joint& j : sk->joints) {
-                if (jointIdx * 2 + 1 < 20) {
-                    j.targetAngle = recvBuffer[jointIdx * 2];
-                    j.stiffness   = recvBuffer[jointIdx * 2 + 1];
-                    jointIdx++;
+    void receiveData(Skeleton* sk) {
+        if (frameCount % skipAmount == 0) {
+            int bytesRead = recv(sock, (char*)recvBuffer, sizeof(recvBuffer), 0);
+            if (bytesRead == sizeof(recvBuffer)) {
+                for (int j = 0; j < sk->joints.size(); j++) {
+                    sk->joints[j].targetAngle = fmod(recvBuffer[j], 2.0f * glm::pi<float>());
+                    sk->joints[j].stiffness   = recvBuffer[j + 10];
                 }
             }
+        }
+    }
+    void sendData(Skeleton* sk) {
+        if (frameCount % skipAmount == 0) {
+            int i = 0;
+
+            // 11 bones × 6 floats = 66
+            // for (Bone* b : sk->bones) {
+            //     stateBuffer[i++] = b->pos.x;
+            //     stateBuffer[i++] = b->pos.y;
+            //     stateBuffer[i++] = b->vel.x;
+            //     stateBuffer[i++] = b->vel.y;
+            //     stateBuffer[i++] = b->angle;
+            //     stateBuffer[i++] = b->angVel;
+            // }
+
+            // 10 joints × 2 floats = 20
+            for (Joint& jt : sk->joints) {
+                stateBuffer[i++] = jt.targetAngle;
+            }
+            for (Joint& jt : sk->joints) {
+                stateBuffer[i++] = jt.stiffness;
+            }
+
+            sendto(sendSock, (char*)stateBuffer, i * sizeof(float), 0, (sockaddr*)&python, sizeof(python));
+        }
+        frameCount++;
+    }
+};
+Data dataManager;
+
+
+// ------ Callbacks ------
+static void cursor_position_callback(GLFWwindow* window, double xpos, double ypos) {
+    int width, height;
+    glfwGetWindowSize(window, &width, &height);
+    mousePos = vec2(xpos, height - ypos);
 }
-        // -------- SKELETON MECHANICS --------
+static void mouse_button_callback(GLFWwindow* window, int button, int action, int mods) {
+    if (button == GLFW_MOUSE_BUTTON_LEFT) {
+        mouseDown = (action == GLFW_PRESS);
+    }
+}
+
+// ------------------------ MAIN ------------------------
+int main() {
+    Skeleton* figure = new Skeleton();
+    Bone* dragBone=nullptr; vec2 dragOffset;
+    glfwSetCursorPosCallback(engine.window,   cursor_position_callback);
+    glfwSetMouseButtonCallback(engine.window, mouse_button_callback);
+
+    for (Joint& j : figure->joints) cout<<"Joint: targetAngle="<<j.targetAngle<<" stiffness="<<j.stiffness<<endl;
+
+    float dt = 1.0/60.0;
+    double lastPrintTime = 0.0;
+    while(!glfwWindowShouldClose(engine.window)) {
+        engine.run();
+
+        // ------ RECIEVE DATA FROM PYTHON -------
+        dataManager.receiveData(figure);
+
+
+
         // --- Select drag bone ---
         if (mouseDown && !dragBone) {
-            for (Bone* b : sk->bones)
+            for (Bone* b : figure->bones)
                 if (length(mousePos - b->pos) < 30.f) {
                     dragBone = b;
                     vec2 d = mousePos - b->pos;
@@ -450,109 +418,54 @@ int main () {
                                 d.x*sin(-b->angle)+d.y*cos(-b->angle)};
                     break;
                 };
+        } else if (!mouseDown) dragBone = nullptr;
+        // ---- Euler Integrate Gravity & Draw ----
+        for (Bone* b : figure->bones) {
+            b->vel += g * dt;
+            // air resistance, joint friction, yea you get it :D
+            b->vel    *= 1.0f / (1.0f + 0.7f * dt);
+            b->angVel *= 1.0f / (1.0f + 0.7f * dt);
+
+            b->draw();
+
+            if (dragBone == b) b->vel = (mousePos - b->pos) / dt;
         }
-        if (!mouseDown) dragBone = nullptr;
-
-        // --- Joint Controls ---
-        bool draw1 = sk->j1 && sk->j2;
-        
-        for (Joint& j : sk->joints) {
-
-            float err = j.targetAngle - (j.B->angle - j.A->angle);
-            float vel = j.B->angularVelocity - j.A->angularVelocity;
-
-            float effInertia = 1.0f / (j.A->invInertia + j.B->invInertia);
-            float criticalDamping = 2.0f * sqrtf(j.stiffness * effInertia) * 0.8f;
-
-            float torque = glm::clamp(j.stiffness*err - criticalDamping*vel, -5e7f, 5e7f);
-
-            j.A->angularVelocity -= torque * j.A->invInertia * dt;
-            j.B->angularVelocity += torque * j.B->invInertia * dt;
-
-            if (draw1 && ((j.A==sk->j1->A && j.B==sk->j1->B) ||
-                        (j.A==sk->j2->A && j.B==sk->j2->B)))
-                engine.drawCircle(j.A->worldPoint(j.anchorA_local),7,{1,1,0});
-        }
-        // --- integrate motion ---
-        for (Bone* b : sk->bones) {
-            b->vel += g*dt;
-            b->oldPos = b->pos;  b->oldAngle = b->angle;
-
-            b->vel *= .99f;  b->angularVelocity *= .99f;
-
-            b->pos += b->vel*dt;
-            b->angle += b->angularVelocity*dt;
-
-            checkBorderCollision(b);
-        }
-        // --- solve joints ---
-        for (int it=0; it<8; it++) {
-
-            if (dragBone) dragBone->pos = mousePos;
-
-            for (Joint& j : sk->joints) {
-
-                vec2 A = j.A->worldPoint(j.anchorA_local);
-                vec2 B = j.B->worldPoint(j.anchorB_local);
-
-                vec2 mid = (A+B)*.5f;
-                vec2 rA = mid - j.A->pos;
-                vec2 rB = mid - j.B->pos;
-
-                vec2 err = B - A;
-
-                float k11 = j.A->invMass + j.B->invMass +
-                            j.A->invInertia*rA.y*rA.y + j.B->invInertia*rB.y*rB.y;
-
-                float k12 = -j.A->invInertia*rA.x*rA.y - j.B->invInertia*rB.x*rB.y;
-
-                float k22 = j.A->invMass + j.B->invMass +
-                            j.A->invInertia*rA.x*rA.x + j.B->invInertia*rB.x*rB.x;
-
-                float det = k11*k22 - k12*k12;
-                if (fabs(det) < 1e-6f) continue;
-
-                vec2 P{ (k22*err.x - k12*err.y)/det,
-                    (-k12*err.x + k11*err.y)/det };
-
-                j.A->pos   += P * j.A->invMass;
-                j.B->pos   -= P * j.B->invMass;
-
-                j.A->angle += j.A->invInertia * (rA.x*P.y - rA.y*P.x);
-                j.B->angle -= j.B->invInertia * (rB.x*P.y - rB.y*P.x);
+        // ---- Solve Joints & Apply Torque---
+        for(int i=0;i<100;i++) {
+            for (Joint& j : figure->joints){
+                j.solve(dt);
+                j.applyTorque(dt);
             }
         }
-        // --- update velocity + draw ---
-        for (Bone* b : sk->bones) {
-            b->vel = (b->pos - b->oldPos)/dt;
-            b->angularVelocity = (b->angle - b->oldAngle)/dt;
-            if (!train_mode)
-                b->draw();
-        }
-        // --- selected joint UI ---
-        if (!sk->joints.empty()) {
-            auto it = sk->joints.begin();
-            std::advance(it, selectedJointIndex);
-            engine.drawCircle(it->A->worldPoint(it->anchorA_local),4,{1,0,0});
+        // ---- Euler Integrate ----
+        for (Bone* b : figure->bones) {
+            b->pos += b->vel * dt;
+            b->angle += b->angVel * dt;
+            figure->checkBorderCollision(b);
         }
 
 
-        // --- Send Observations to Python ---
-        int i = 0;
-        for (Bone* b : sk->bones) {
-            if (i + 5 < 66) {
-                stateBuffer[i++] = b->pos.x;
-                stateBuffer[i++] = b->pos.y;
-                stateBuffer[i++] = b->vel.x;
-                stateBuffer[i++] = b->vel.y;
-                stateBuffer[i++] = b->angle;
-                stateBuffer[i++] = b->angularVelocity;
-            }
-        }
-        sendto(sendSock, (char*)stateBuffer, sizeof(stateBuffer), 0, (sockaddr*)&pythonAddr, sizeof(pythonAddr));
 
-        if (!train_mode)
+        // ------ SEND DATA TO PYTHON -------
+        dataManager.sendData(figure);
+
+
+        // ------ PRINT STATS -------
+        if (glfwGetTime() - lastPrintTime > 5.0) {
             glfwSwapBuffers(engine.window);
+            for (Bone* j : figure->bones)
+                cout<<"Bone angle: "<<j->angle<<endl;
+            
+            cout<<"--------------------------------"<<endl;
+            lastPrintTime = glfwGetTime();
+        }
+
+        
+        
+        glfwSwapBuffers(engine.window);
         glfwPollEvents();
     }
+
+    // Exit Program
+    glfwTerminate(); return 0;
 }
