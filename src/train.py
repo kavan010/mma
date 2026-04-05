@@ -97,17 +97,18 @@ while True:
     state = udp.get_state()
     for t in range(T):
         dist = policy(state)
-        action = dist.sample()
-        log_prob = dist.log_prob(action)
-        action = 0.5 * torch.tanh(action)
+        raw_action = dist.sample()
+        log_prob = dist.log_prob(raw_action).sum()
+        action = 0.5 * torch.tanh(raw_action)
         value = value_net(state)
 
         next_state = udp.step(action.item())
-        r = reward(state)
-        print(f"Action: {action.item():.3f} | Reward: {r.item():.3f}")
-        done = isFailed(state)
+        r = reward(next_state)
+        done = isFailed(next_state)
 
-        states.append(state)
+        print(f"log_prob: {log_prob.item()}, Action: {action.item()}, Reward: {r.item()}, Done: {done}")
+
+        states.append(next_state)
         actions.append(action)
         rewards.append(r)
         dones.append(done)
@@ -119,9 +120,9 @@ while True:
         if done:
             udp.send_actions([-69.0])
 
-    # advantages = compute_advantages(rewards, values)
+    # advantages = compute_advantages(rewards, values, dones)
     # for _ in range(K_epochs):
-    #     update_policy(states, actions, advantages)
+    #     update_policy(states, actions, log_probs, advantages, values)
         
 
 torch.save(policy.state_dict(), "ppo_double_pendulum.pt")
