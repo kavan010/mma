@@ -1,60 +1,127 @@
 import torch
 import torch.nn as nn
+from torch.distributions import Normal
+import torch.optim as optim
+import math
 import socket
 import struct
-
-anglesGood = torch.tensor([5, 4.95, 3, 4, 0, 0, 1, 2, 0, 0], dtype=torch.float32)
-stiffGood  = torch.tensor([1, 1, 1, 1, 1, 1, 1, 1, 1, 1],    dtype=torch.float32)
-target     = torch.cat([anglesGood, stiffGood])
 
 class UDP:
     def __init__(self, ip, recv_port, send_port):
         self.recv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.recv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.recv_sock.bind((ip, recv_port))
         self.send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.send_addr = (ip, send_port)
 
-    def receive(self, num_floats=20):
+    def receive_state(self, num_floats=6):
         data, _ = self.recv_sock.recvfrom(num_floats * 4)
         return struct.unpack(f"{num_floats}f", data)
-    def send(self, actions):
+    def send_actions(self, actions):
         self.send_sock.sendto(struct.pack(f"{len(actions)}f", *actions), self.send_addr)
+    def get_state(self):
+        self.send_actions([-100.0])
+        s = torch.tensor(self.receive_state(), dtype=torch.float32)
+        return s
+    def step(self, target_angle):
+        self.send_actions([target_angle])
+        self.send_actions([-100.0])
+        s = torch.tensor(self.receive_state(), dtype=torch.float32)
+        return s
 udp = UDP("127.0.0.1", 5006, 5005)
 
+class Policy(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(6, 64),
+            nn.Tanh(),
+            nn.Linear(64, 64),
+            nn.Tanh(),
+        )
+        self.mean = nn.Linear(64, 1)
+        self.log_std = nn.Parameter(torch.zeros(1))
 
-net = nn.Sequential(
-    nn.Linear(20, 128), nn.Tanh(),
-    nn.Linear(128, 128), nn.Tanh(),
-    nn.Linear(128, 20)
-)
-opt = torch.optim.Adam(net.parameters(), lr=1e-3)
+    def forward(self, s):
+        h = self.net(s)
+        mean = self.mean(h)
+        std = self.log_std.exp()
+        return Normal(mean, std)
+policy = Policy()
 
-try:
-    net.load_state_dict(torch.load("model.pt"))
-    print("loaded model")
-except:
-    print("starting fresh")
+class ValueNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(6, 64),
+            nn.Tanh(),
+            nn.Linear(64, 64),
+            nn.Tanh(),
+            nn.Linear(64, 1)
+        )
 
-for step in range(50000):
-    state     = torch.cat([torch.rand(10) * 6.28, torch.rand(10)]).unsqueeze(0)
-    action    = net(state)
-    new_state = state + action
+    def forward(self, s):
+        return self.net(s)
+value_net = ValueNet()
 
-    reward = -(new_state.squeeze() - target).abs().mean()
-    loss   = -reward
+def reward(state):
+    sin1, cos1, sin2, cos2, angVel1, angVel2 = state
+    theta1 = torch.atan2(sin1, cos1)
+    theta2 = torch.atan2(sin2, cos2)
+    err1 = torch.atan2(torch.sin(theta1 - math.pi), torch.cos(theta1 - math.pi))
+    err2 = torch.atan2(torch.sin(theta2 - math.pi), torch.cos(theta2 - math.pi))
+    r = torch.cos(err1) + torch.cos(err2)
+    r -= 0.01 * (angVel1**2 + angVel2**2)
+    return r
+def isFailed(state):
+    sin1, cos1, sin2, cos2, angVel1, angVel2 = state
+    theta1 = torch.atan2(sin1, cos1)
+    theta2 = torch.atan2(sin2, cos2)
+    err1 = torch.atan2(torch.sin(theta1 - math.pi), torch.cos(theta1 - math.pi))
+    err2 = torch.atan2(torch.sin(theta2 - math.pi), torch.cos(theta2 - math.pi))
+    return abs(err2) > 1.5 or abs(err1) > 1.5
 
-    opt.zero_grad()
-    loss.backward()
-    opt.step()
+opt = optim.Adam(policy.parameters(), lr=1e-4)
+value_opt = optim.Adam(value_net.parameters(), lr=1e-4)
 
-    if step % 100 == 0:
-        vals = new_state.squeeze().detach()
-        print(f"\nstep {step:6d} | reward {reward.item():.4f}")
-        for i in range(10):
-            print(f"  joint {i} | angle {vals[i]:.4f} (target {target[i]:.2f}) | stiff {vals[i+10]:.4f} (target {target[i+10]:.2f})")
 
-    if step % 10000 == 0 and step > 0:
-        torch.save(net.state_dict(), "model.pt")
+T = 1
+# for iteration in range(N):
+while True:
+    states = []
+    actions = []
+    rewards = []
+    dones = []
+    log_probs = []
+    values = []
 
-torch.save(net.state_dict(), "model.pt")
+    state = udp.get_state()
+    for t in range(T):
+        dist = policy(state)
+        action = dist.sample()
+        log_prob = dist.log_prob(action)
+        action = 0.5 * torch.tanh(action)
+        value = value_net(state)
+
+        next_state = udp.step(action.item())
+        r = reward(state)
+        print(f"Action: {action.item():.3f} | Reward: {r.item():.3f}")
+        done = isFailed(state)
+
+        states.append(state)
+        actions.append(action)
+        rewards.append(r)
+        dones.append(done)
+        log_probs.append(log_prob)
+        values.append(value)
+
+        state = next_state
+
+        if done:
+            udp.send_actions([-69.0])
+
+    # advantages = compute_advantages(rewards, values)
+    # for _ in range(K_epochs):
+    #     update_policy(states, actions, advantages)
+        
+
+torch.save(policy.state_dict(), "ppo_double_pendulum.pt")

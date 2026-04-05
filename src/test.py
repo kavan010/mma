@@ -1,45 +1,96 @@
 import torch
 import torch.nn as nn
+from torch.distributions import Normal
+import math
 import socket
 import struct
-
-anglesGood = torch.tensor([5, 4.95, 3, 4, 0, 0, 1, 2, 0, 0], dtype=torch.float32)
-stiffGood  = torch.tensor([1, 1, 1, 1, 1, 1, 1, 1, 1, 1],    dtype=torch.float32)
-target     = torch.cat([anglesGood, stiffGood])
 
 class UDP:
     def __init__(self, ip, recv_port, send_port):
         self.recv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.recv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.recv_sock.bind((ip, recv_port))
         self.send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.send_addr = (ip, send_port)
 
-    def receive(self, num_floats=20):
+    def receive_state(self, num_floats=6):
         data, _ = self.recv_sock.recvfrom(num_floats * 4)
         return struct.unpack(f"{num_floats}f", data)
 
-    def send(self, actions):
+    def send_actions(self, actions):
         self.send_sock.sendto(struct.pack(f"{len(actions)}f", *actions), self.send_addr)
 
 udp = UDP("127.0.0.1", 5006, 5005)
 
-net = nn.Sequential(
-    nn.Linear(20, 128), nn.Tanh(),
-    nn.Linear(128, 128), nn.Tanh(),
-    nn.Linear(128, 20)
-)
-net.load_state_dict(torch.load("model.pt"))
-net.eval()
+class Policy(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(6, 64),
+            nn.Tanh(),
+            nn.Linear(64, 64),
+            nn.Tanh(),
+        )
+        self.mean = nn.Linear(64, 1)
+        self.log_std = nn.Parameter(torch.zeros(1))
 
-step = 0
-while True:
-    state     = torch.tensor(udp.receive(), dtype=torch.float32).unsqueeze(0)
-    vals      = (state + net(state)).squeeze().detach()
-    udp.send(vals.tolist())
+    def forward(self, s):
+        h = self.net(s)
+        mean = self.mean(h)
+        std = self.log_std.exp()
+        return Normal(mean, std)
 
-    if step % 10 == 0:
-        print(f"\nstep {step:6d}")
-        for i in range(10):
-            print(f"  joint {i} | angle {vals[i]:.4f} (target {target[i]:.2f}) | stiff {vals[i+10]:.4f} (target {target[i+10]:.2f})")
-    step += 1
+policy = Policy()
+policy.load_state_dict(torch.load("double_pendulum_policy.pt"))
+policy.eval()
+print("Model loaded.")
+
+def get_state():
+    udp.send_actions([-100.0])
+    angle1, angVel1, angle2, angVel2, joint_y, tip_y = udp.receive_state()
+    return torch.tensor([angle1, angVel1, angle2, angVel2, joint_y, tip_y], dtype=torch.float32)
+
+def step(target_angle):
+    udp.send_actions([target_angle])
+    udp.send_actions([-100.0])
+    angle1, angVel1, angle2, angVel2, joint_y, tip_y = udp.receive_state()
+    return torch.tensor([angle1, angVel1, angle2, angVel2, joint_y, tip_y], dtype=torch.float32)
+
+def reward(state):
+    joint_y = state[4].item()
+    tip_y   = state[5].item()
+    return tip_y - joint_y
+
+def is_failed(state):
+    joint_y = state[4].item()
+    tip_y   = state[5].item()
+    return tip_y < joint_y - 0.1
+
+NUM_EPISODES = 2000
+STEPS = 400
+
+for episode in range(NUM_EPISODES):
+    state = get_state()
+    rewards = []
+
+    for t in range(STEPS):
+        with torch.no_grad():
+            dist = policy(state)
+            action = dist.mean                  # deterministic, no exploration
+            target_angle = float(torch.remainder(action, 2 * math.pi))
+
+        next_state = step(target_angle)
+        r = reward(next_state)
+        rewards.append(r)
+        state = next_state
+
+        joint_y = next_state[4].item()
+        tip_y   = next_state[5].item()
+        print(f"  t={t:03d} | rod1={next_state[0].item():.3f} | rod2={next_state[2].item():.3f} | joint_y={joint_y:.3f} | tip_y={tip_y:.3f} | r={r:.4f}")
+
+        if is_failed(next_state):
+            udp.send_actions([-69.0])
+            print("  !! FAILED")
+            break
+
+    avg = sum(rewards) / len(rewards)
+    print(f"\nEP {episode} | Steps: {len(rewards)} | Avg Reward: {avg:.4f}\n")

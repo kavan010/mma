@@ -13,7 +13,7 @@
 using namespace glm; using namespace std;
 
 
-// ------------------------ Engine & Constants ----------------------
+// ------------------------ Engine & Constants ------------------------
 vec2 g(0.0f, -980.6f);
 vec2 mousePos; bool mouseDown = false;
 struct Engine {
@@ -25,7 +25,7 @@ struct Engine {
             cerr << "Failed to initialize GLFW" << endl; exit(EXIT_FAILURE);
         }
 
-        window = glfwCreateWindow(WIDTH, HEIGHT, "RL is pain", nullptr, nullptr);
+        window = glfwCreateWindow(WIDTH, HEIGHT, "2D atom sim by kavan", nullptr, nullptr);
         if (!window) {
             cerr << "Failed to create GLFW window" << endl;
             glfwTerminate(); exit(EXIT_FAILURE);
@@ -69,6 +69,7 @@ struct Engine {
             mouseDown = (action == GLFW_PRESS);
         }
     }
+
 };
 Engine engine;
 
@@ -138,11 +139,10 @@ struct Joint {
     float maxTorque = 1e5f;
 
     // --- Controller Properties ---
-    float targetAngle = 0;
-    float stiffness = 1.0f;
+    float targetAngle = 0.0f;
+    float stiffness = 0.0f;
 
-    Joint(Bone* a, Bone* b, vec2 anchorA, vec2 anchorB, float targetAngle=0.0f, float stiffness=1.0f) : 
-    A(a), B(b), anchorA_local(anchorA), anchorB_local(anchorB), targetAngle(targetAngle), stiffness(stiffness) { }
+    Joint(Bone* a, Bone* b, vec2 anchorA, vec2 anchorB, float targetAngle=3.14f) : A(a), B(b), anchorA_local(anchorA), anchorB_local(anchorB), targetAngle(targetAngle) { }
 
     void solve(float dt) {
         Bone* A = this->A; Bone* B = this->B;
@@ -184,15 +184,14 @@ struct Joint {
         B->angVel += cross(rB, impulse) * B->invInertia;
     }
     void applyTorque(float dt) {
-
         float angle   = B->angle - A->angle;
         float angVel  = B->angVel - A->angVel;
         float error   = targetAngle - angle;
 
         float k = stiffness * maxTorque;
-        //float d = 2.0f * sqrt(k * (A->inertia + B->inertia));  // critical damping
+        float d = 2.0f * sqrt(k * (A->inertia + B->inertia));  // critical damping
 
-        float torque  = k * error;
+        float torque  = k * error - d * angVel;
 
         // clamp to maxTorque so it cant explode
         torque = glm::clamp(torque, -maxTorque, maxTorque);
@@ -209,22 +208,45 @@ struct Skeleton {
     vector<Bone*> bones;
     vector<Joint> joints;
 
-    Bone *rod1, *rod2, *ground;
+    Bone *body,*head,*hip,*armR,*armL,*forearmR,*forearmL,*legR,*legL,*calfR,*calfL;
 
     Skeleton(){ init(); }
 
     void init() {
         // ---- Bones ----
-        rod1     = new Bone({250,200},3.14f/2.0f,40,5,7);
-        rod2 = new Bone({250,200},3.14f/2.0f,40,5,7);
-        ground = new Bone({400,300},-3.14f/2.0f,2,1,70000);
+        body     = new Bone({400,130},1.50f,25,25,24.0);
+        head     = new Bone({400,200},6.45816f,15,15,6.0);
+        hip      = new Bone({400,200},6.35747f,15,15,10.0);
 
-        bones = {rod1,rod2,ground};
+        armR     = new Bone({250,200},4.44994f,20,7,20.5);
+        armL     = new Bone({550,200},5.48231f,20,7,20.5);
+
+        forearmR = new Bone({250,200},4.44997f,20,7,10.5);
+        forearmL = new Bone({550,200},5.48231f,20,7,10.5);
+
+        legR     = new Bone({250,200},7.3253f,25,10,7.0);
+        legL     = new Bone({550,200},8.36471f,25,10,7.0);
+
+        calfR    = new Bone({250,200},7.32835f,20,7,3.5);
+        calfL    = new Bone({550,200},8.36382f,20,7,3.5);
+
+        bones = {body,head,hip,armR,armL,forearmR,forearmL,legR,legL,calfR,calfL};
 
         // Joints 
-        joints.push_back(Joint(ground,rod1,{0,0},{-rod1->halfLength,0}, 3.14, 1.0f));
-        joints.push_back(Joint(rod1,rod2,{rod1->halfLength,0},{rod2->halfLength,0},3.14,0.0f));
+        joints.push_back(Joint(body,head,{body->halfLength,0},{0,-head->halfLength}, 1.0f));
+        joints.push_back(Joint(body,hip,{-body->halfLength,0},{0,hip->halfLength}, 4.95f));
 
+        joints.push_back(Joint(body,armR,{body->halfLength*0.34f,-body->radius*0.94f},{armR->halfLength,0},3.0f));
+        joints.push_back(Joint(body,armL,{body->halfLength*0.34f, body->radius*0.94f},{armL->halfLength,0},4.0f));
+
+        joints.push_back(Joint(armR,forearmR,{-armR->halfLength,0},{forearmR->halfLength,0},0.0f));
+        joints.push_back(Joint(armL,forearmL,{-armL->halfLength,0},{forearmL->halfLength,0},0.0f));
+
+        joints.push_back(Joint(hip,legR,{-hip->radius*0.71f,-hip->radius*0.71f},{legR->halfLength,0},1.0f));
+        joints.push_back(Joint(hip,legL,{ hip->radius*0.71f,-hip->radius*0.71f},{legL->halfLength,0},2.0f));
+
+        joints.push_back(Joint(legR,calfR,{-legR->halfLength,0},{calfR->halfLength,0},0.0f));
+        joints.push_back(Joint(legL,calfL,{-legL->halfLength,0},{calfL->halfLength,0},0.0f));
 
         // Initial constraint alignment
         for(auto& j : joints){
@@ -233,18 +255,14 @@ struct Skeleton {
         }
     }
 
-    void step(float dt) {
+    void step(float dt, Bone* dragBone) {
         // ---- Euler Integrate Gravity & Draw ----
         for (Bone* b : bones) {
-            if (b != ground)
             b->vel += g * dt;
-            else {
-                b->vel=vec2(0.0f);
-                b->angVel=0.0f;
-            }
             b->vel    *= 1.0f / (1.0f + 0.7f * dt);
             b->angVel *= 1.0f / (1.0f + 0.7f * dt);
             b->draw();
+            if (dragBone == b) b->vel = (mousePos - b->pos) / dt;
         }
         // ---- Solve Joints & Apply Torque---
         for(int i=0;i<100;i++) {
@@ -255,23 +273,45 @@ struct Skeleton {
         }
         // ---- Euler Integrate ----
         for (Bone* b : bones) {
-            if (b != ground)
-                b->pos += b->vel * dt;\
-                b->angVel = glm::clamp(b->angVel, -50.0f, 50.0f);
-            if (b != ground)
+            b->pos += b->vel * dt;
             b->angle += b->angVel * dt;
             checkBorderCollision(b);
         }
     }
     void reset() {
-        rod1->pos = {250, 200};   // add these
-        rod1->vel = {0, 0};
-        rod2->vel = {0, 0};
-        rod1->angle = 3.14f/2.0f;
-        rod1->angVel = 0;
-        rod2->angle = 3*3.14f/2.0f + ((rand() % 100) / 100.0f - 0.5f) * 0.1f;
-        rod2->angVel = 0;
-        for (auto& j : joints) {
+        *body     = Bone({400,130},1.50f,25,25,24.0);
+        *head     = Bone({400,200},6.45816f,15,15,6.0);
+        *hip      = Bone({400,200},6.35747f,15,15,10.0);
+
+        *armR     = Bone({250,200},4.44994f,20,7,20.5);
+        *armL     = Bone({550,200},5.48231f,20,7,20.5);
+
+        *forearmR = Bone({250,200},4.44997f,20,7,10.5);
+        *forearmL = Bone({550,200},5.48231f,20,7,10.5);
+
+        *legR     = Bone({250,200},7.3253f,25,10,7.0);
+        *legL     = Bone({550,200},8.36471f,25,10,7.0);
+
+        *calfR    = Bone({250,200},7.32835f,20,7,3.5);
+        *calfL    = Bone({550,200},8.36382f,20,7,3.5);
+
+        joints.clear();
+        joints.push_back(Joint(body,head,{body->halfLength,0},{0,-head->halfLength}, 5.0f));
+        joints.push_back(Joint(body,hip,{-body->halfLength,0},{0,hip->halfLength}, 4.95f));
+
+        joints.push_back(Joint(body,armR,{body->halfLength*0.34f,-body->radius*0.94f},{armR->halfLength,0},3.0f));
+        joints.push_back(Joint(body,armL,{body->halfLength*0.34f, body->radius*0.94f},{armL->halfLength,0},4.0f));
+
+        joints.push_back(Joint(armR,forearmR,{-armR->halfLength,0},{forearmR->halfLength,0},0.0f));
+        joints.push_back(Joint(armL,forearmL,{-armL->halfLength,0},{forearmL->halfLength,0},0.0f));
+
+        joints.push_back(Joint(hip,legR,{-hip->radius*0.71f,-hip->radius*0.71f},{legR->halfLength,0},1.0f));
+        joints.push_back(Joint(hip,legL,{ hip->radius*0.71f,-hip->radius*0.71f},{legL->halfLength,0},2.0f));
+
+        joints.push_back(Joint(legR,calfR,{-legR->halfLength,0},{calfR->halfLength,0},0.0f));
+        joints.push_back(Joint(legL,calfL,{-legL->halfLength,0},{calfL->halfLength,0},0.0f));
+
+        for(auto& j : joints){
             vec2 err = j.A->worldPoint(j.anchorA_local) - j.B->worldPoint(j.anchorB_local);
             j.B->pos += err;
         }
@@ -340,7 +380,6 @@ struct Skeleton {
     }
 };
 
-
 // ------------------------ File Connections ------------------------
 struct Data {
     // Sockets
@@ -348,7 +387,7 @@ struct Data {
     SOCKET sock, sendSock;
     sockaddr_in server, python;
 
-    float recvBuffer[1], stateBuffer[6];
+    float recvBuffer[20], stateBuffer[23];
     bool primed = false;
     Data() {
         WSAStartup(MAKEWORD(2,2), &w);
@@ -369,14 +408,25 @@ struct Data {
     bool receiveData(Skeleton* sk) {
         int bytesRead = recv(sock, (char*)recvBuffer, sizeof(recvBuffer), 0);
 
-        if (bytesRead != sizeof(recvBuffer)) {
+        if (bytesRead != sizeof(recvBuffer))
             return false;
+        if (recvBuffer[0] == -69){
+            sk->reset();
         } else if (recvBuffer[0] == -100){
             return true;
-        } else if (recvBuffer[0] == -69){
-            sk->reset();
         } else {
-            sk->joints[0].targetAngle = recvBuffer[0]+3.14f;
+            // cout<<"\n\nRECIEVING: ";
+            // for (int j = 0; j < 20; j++) {
+            //     cout<<recvBuffer[j]<<" ";
+            // }
+            // cout<<"\nHead Pos: ("<<sk->head->pos.x<<", "<<sk->head->pos.y<<")   Body Angle: "<<sk->body->angle<<endl;
+            // cout<<"--------------------------------"<<endl;
+            for (int j = 0; j < sk->joints.size(); j++) {
+                //sk->joints[j].targetAngle = fmod(recvBuffer[j], 6.28);
+                //sk->joints[j].targetAngle = fmod(recvBuffer[j], 6.28);
+                sk->joints[j].targetAngle = recvBuffer[j];
+                sk->joints[j].stiffness = recvBuffer[j + 10];
+            }
         }
 
         return false; 
@@ -384,61 +434,70 @@ struct Data {
     void sendData(Skeleton* sk) {
         int i = 0;
 
-        float angle1   = sk->joints[0].B->angle - sk->joints[0].A->angle;
-        float angle2   = sk->joints[1].B->angle - sk->joints[1].A->angle;
-        stateBuffer[i++] =  sin(angle1);
-        stateBuffer[i++] =  cos(angle1);
-        stateBuffer[i++] =  sin(angle2);
-        stateBuffer[i++] =  cos(angle2);
-        stateBuffer[i++] =  sk->rod1->angVel;
-        stateBuffer[i++] =  sk->rod2->angVel;
+        for (Joint& jt : sk->joints) {
+            stateBuffer[i++] = jt.targetAngle;
+        }
+        for (Joint& jt : sk->joints) {
+            stateBuffer[i++] = jt.stiffness;
+        }
+        stateBuffer[i++] =  sk->head->pos.x / 800.0f;
+        stateBuffer[i++] =  sk->head->pos.y / 600.0f;
+        stateBuffer[i++] =  sk->body->angle / 6.28f;
+        // cout<<"\nSENDING: ";
+        // for (int j = 0; j < 23; j++) {
+        //     cout<<stateBuffer[j]<<" ";
+        // }
+        // cout<<"\n"<<endl;
 
         sendto(sendSock, (char*)stateBuffer, i * sizeof(float), 0, (sockaddr*)&python, sizeof(python));
     }
 };
 Data dataManager;
 
-// ------ Keyboard Callback ------
-static void key_callback(GLFWwindow* window, int key, int scancode, int action, int mods) {
-    if (action == GLFW_PRESS || action == GLFW_REPEAT) {
-        // Retrieve the Skeleton object associated with the window
-        Skeleton* figure = static_cast<Skeleton*>(glfwGetWindowUserPointer(window));
-        if (!figure) return;
-        float angle_delta = 0.1f; // Small adjustment in radians
-        if (key == GLFW_KEY_LEFT) {
-            figure->joints[0].targetAngle -= angle_delta;
-            cout << "Joint 0 targetAngle: " << figure->joints[0].targetAngle << endl;
-        } else if (key == GLFW_KEY_RIGHT) {
-            figure->joints[0].targetAngle += angle_delta;
-            cout << "Joint 0 targetAngle: " << figure->joints[0].targetAngle << endl;
-        }
-    }
-}
+
+
 // ------------------------ MAIN ------------------------
 int main() {
     Skeleton* figure = new Skeleton();
     Bone* dragBone=nullptr; vec2 dragOffset;
-    glfwSetWindowUserPointer(engine.window, figure); // Store the figure pointer for callbacks
-    glfwSetKeyCallback(engine.window, key_callback); // Register the new keyboard callback
+    glfwSetCursorPosCallback(engine.window,   engine.cursor_position_callback);
+    glfwSetMouseButtonCallback(engine.window, engine.mouse_button_callback);
     
     float dt = 1.0/60.0;
     double lastPrintTime = 0.0;
     glfwSwapBuffers(engine.window);
     while(!glfwWindowShouldClose(engine.window)) {
         engine.run();
-        
+
         // ------ RECIEVE DATA FROM PYTHON -------
-        bool gotAction = dataManager.receiveData(figure);
+        //bool gotAction = dataManager.receiveData(figure);
 
-        if (gotAction) {
-           figure->step(dt);
-           // ------ SEND DATA TO PYTHON -------
-           dataManager.sendData(figure);
-           glfwSwapBuffers(engine.window);
-        } 
+        // --- Select drag bone ---
+        if (mouseDown && !dragBone) {
+            for (Bone* b : figure->bones)
+                if (length(mousePos - b->pos) < 30.f) {
+                    dragBone = b;
+                    vec2 d = mousePos - b->pos;
+                    dragOffset = {d.x*cos(-b->angle)-d.y*sin(-b->angle),
+                                d.x*sin(-b->angle)+d.y*cos(-b->angle)};
+                    break;
+                };
+        } else if (!mouseDown) dragBone = nullptr;
 
 
-        //glfwSwapBuffers(engine.window);
+        //if (gotAction) {
+             figure->step(dt, dragBone);
+             // ------ SEND DATA TO PYTHON -------
+             //dataManager.sendData(figure);
+             //glfwSwapBuffers(engine.window);
+        //} 
+
+
+        // ------ PRINT STATS -------
+        // if (glfwGetTime() - lastPrintTime > 1.0) {
+        //     lastPrintTime = glfwGetTime();
+        // }
+        glfwSwapBuffers(engine.window);
         glfwPollEvents();
     }
 
