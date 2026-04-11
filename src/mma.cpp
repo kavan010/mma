@@ -215,14 +215,13 @@ struct Skeleton {
 
     void init() {
         // ---- Bones ----
-        rod1     = new Bone({250,200},3.14f/2.0f,40,5,7);
-        rod2 = new Bone({250,200},3.14f/2.0f,40,5,7);
+        cart     = new Bone({250,200},3.14f/2.0f,40,5,7);
+        pole = new Bone({250,200},3.14f/2.0f,40,5,7);
         ground = new Bone({400,300},-3.14f/2.0f,2,1,70000);
 
-        bones = {rod1,rod2,ground};
+        bones = {cart,pole,ground};
 
-        // Joints 
-        joints.push_back(Joint(ground,rod1,{0,0},{-rod1->halfLength,0}, 3.14, 1.0f));
+        // Joints
         joints.push_back(Joint(rod1,rod2,{rod1->halfLength,0},{rod2->halfLength,0},3.14,0.0f));
 
 
@@ -267,11 +266,13 @@ struct Skeleton {
         rod1->pos = {250, 200};   // add these
         rod1->vel = {0, 0};
         rod2->vel = {0, 0};
-        rod1->angle = 3.14f/2.0f;
+        rod1->angle = 3.14f/2.0f + ((rand() % 100) / 100.0f - 0.5f) * 0.2f;;
         rod1->angVel = 0;
-        rod2->angle = 3*3.14f/2.0f + ((rand() % 100) / 100.0f - 0.5f) * 0.1f;
+        rod2->angle = 3*3.14f/2.0f + ((rand() % 100) / 100.0f - 0.5f) * 0.2f;
         rod2->angVel = 0;
+        
         for (auto& j : joints) {
+            j.targetAngle = 3.14f;
             vec2 err = j.A->worldPoint(j.anchorA_local) - j.B->worldPoint(j.anchorB_local);
             j.B->pos += err;
         }
@@ -428,14 +429,14 @@ int main() {
         engine.run();
         
         // ------ RECIEVE DATA FROM PYTHON -------
-        bool gotAction = dataManager.receiveData(figure);
+        //bool gotAction = dataManager.receiveData(figure);
 
-        if (gotAction) {
-           figure->step(dt);
-           // ------ SEND DATA TO PYTHON -------
-           dataManager.sendData(figure);
-           glfwSwapBuffers(engine.window);
-        } 
+        //if (gotAction) {
+            figure->step(dt);
+            // ------ SEND DATA TO PYTHON -------
+            //dataManager.sendData(figure);
+            glfwSwapBuffers(engine.window);
+        //} 
 
 
         //glfwSwapBuffers(engine.window);

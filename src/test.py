@@ -1,10 +1,14 @@
+from time import time, sleep
+
 import torch
 import torch.nn as nn
 from torch.distributions import Normal
-import math
 import socket
 import struct
+import math
 
+
+# --- UDP (same as yours) ---
 class UDP:
     def __init__(self, ip, recv_port, send_port):
         self.recv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -15,12 +19,20 @@ class UDP:
     def receive_state(self, num_floats=6):
         data, _ = self.recv_sock.recvfrom(num_floats * 4)
         return struct.unpack(f"{num_floats}f", data)
-
     def send_actions(self, actions):
         self.send_sock.sendto(struct.pack(f"{len(actions)}f", *actions), self.send_addr)
+    def get_state(self):
+        self.send_actions([-100.0])
+        s = torch.tensor(self.receive_state(), dtype=torch.float32)
+        return s
+    def step(self, target_angle):
+        self.send_actions([target_angle])
+        self.send_actions([-100.0])
+        s = torch.tensor(self.receive_state(), dtype=torch.float32)
+        return s
 
-udp = UDP("127.0.0.1", 5006, 5005)
 
+# --- POLICY (same architecture) ---
 class Policy(nn.Module):
     def __init__(self):
         super().__init__()
@@ -39,58 +51,40 @@ class Policy(nn.Module):
         std = self.log_std.exp()
         return Normal(mean, std)
 
+
+# --- LOAD MODEL ---
 policy = Policy()
-policy.load_state_dict(torch.load("double_pendulum_policy.pt"))
+policy.load_state_dict(torch.load("ppo_double_pendulum.pt"))
 policy.eval()
-print("Model loaded.")
 
-def get_state():
-    udp.send_actions([-100.0])
-    angle1, angVel1, angle2, angVel2, joint_y, tip_y = udp.receive_state()
-    return torch.tensor([angle1, angVel1, angle2, angVel2, joint_y, tip_y], dtype=torch.float32)
+def isFailed(state):
+    sin1, cos1, sin2, cos2, angVel1, angVel2 = state
+    theta1 = torch.atan2(sin1, cos1)
+    theta2 = torch.atan2(sin2, cos2)
+    err1 = torch.atan2(torch.sin(theta1 - math.pi), torch.cos(theta1 - math.pi))
+    err2 = torch.atan2(torch.sin(theta2 - math.pi), torch.cos(theta2 - math.pi))
+    return abs(err2) > 1.5 or abs(err1) > 1.5
 
-def step(target_angle):
-    udp.send_actions([target_angle])
-    udp.send_actions([-100.0])
-    angle1, angVel1, angle2, angVel2, joint_y, tip_y = udp.receive_state()
-    return torch.tensor([angle1, angVel1, angle2, angVel2, joint_y, tip_y], dtype=torch.float32)
+# --- RUN ---
+udp = UDP("127.0.0.1", 5006, 5005)
 
-def reward(state):
-    joint_y = state[4].item()
-    tip_y   = state[5].item()
-    return tip_y - joint_y
+state = udp.get_state()
 
-def is_failed(state):
-    joint_y = state[4].item()
-    tip_y   = state[5].item()
-    return tip_y < joint_y - 0.1
+while True:
+    with torch.no_grad():
+        dist = policy(state)
+        raw_action = dist.mean
+        action = 0.5 * torch.tanh(raw_action)
 
-NUM_EPISODES = 2000
-STEPS = 400
+    if (isFailed(state)):
+        print("Episode ended. Resetting environment.")
+        udp.send_actions([-69.0])  # Signal to reset
+        state = udp.get_state()
+        continue
 
-for episode in range(NUM_EPISODES):
-    state = get_state()
-    rewards = []
+    target_angle = math.pi + action.item()
 
-    for t in range(STEPS):
-        with torch.no_grad():
-            dist = policy(state)
-            action = dist.mean                  # deterministic, no exploration
-            target_angle = float(torch.remainder(action, 2 * math.pi))
+    state = udp.step(target_angle)
 
-        next_state = step(target_angle)
-        r = reward(next_state)
-        rewards.append(r)
-        state = next_state
-
-        joint_y = next_state[4].item()
-        tip_y   = next_state[5].item()
-        print(f"  t={t:03d} | rod1={next_state[0].item():.3f} | rod2={next_state[2].item():.3f} | joint_y={joint_y:.3f} | tip_y={tip_y:.3f} | r={r:.4f}")
-
-        if is_failed(next_state):
-            udp.send_actions([-69.0])
-            print("  !! FAILED")
-            break
-
-    avg = sum(rewards) / len(rewards)
-    print(f"\nEP {episode} | Steps: {len(rewards)} | Avg Reward: {avg:.4f}\n")
+    print(f"Action: {action.item():.4f}")
+    #sleep(1/15)
