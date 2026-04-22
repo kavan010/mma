@@ -14,6 +14,7 @@ using namespace glm; using namespace std;
 
 
 // ------------------------ Engine & Constants ----------------------
+int NUM_ENV = 2, STATE_DIM = 3;
 vec2 g(0.0f, -980.6f);
 vec2 mousePos; bool mouseDown = false;
 struct Engine {
@@ -71,6 +72,7 @@ struct Engine {
     }
 };
 Engine engine;
+
 
 // ------------------------ Bodies & Physics ------------------------
 vec2 rotate(vec2 v, float a) {
@@ -215,14 +217,15 @@ struct Skeleton {
 
     void init() {
         // ---- Bones ----
-        cart     = new Bone({250,200},3.14f/2.0f,40,5,7);
-        pole = new Bone({250,200},3.14f/2.0f,40,5,7);
+        rod1     = new Bone({250,200},-3.14f/2.0f,40,5,7);
+        rod2     = new Bone({250,200},3.14f/2.0f,40,5,7);
         ground = new Bone({400,300},-3.14f/2.0f,2,1,70000);
 
-        bones = {cart,pole,ground};
+        bones = {rod1,rod2,ground};
 
-        // Joints
-        joints.push_back(Joint(rod1,rod2,{rod1->halfLength,0},{rod2->halfLength,0},3.14,0.0f));
+        // Joints 
+        joints.push_back(Joint(ground,rod1,{0,0},{-rod1->halfLength,0}, 0.0f, 1.0f));
+        joints.push_back(Joint(ground,rod2,{0,0},{-rod2->halfLength,0}, 0.0f, 1.0f));
 
 
         // Initial constraint alignment
@@ -262,20 +265,16 @@ struct Skeleton {
             checkBorderCollision(b);
         }
     }
-    void reset() {
-        rod1->pos = {250, 200};   // add these
-        rod1->vel = {0, 0};
-        rod2->vel = {0, 0};
-        rod1->angle = 3.14f/2.0f + ((rand() % 100) / 100.0f - 0.5f) * 0.2f;;
-        rod1->angVel = 0;
-        rod2->angle = 3*3.14f/2.0f + ((rand() % 100) / 100.0f - 0.5f) * 0.2f;
-        rod2->angVel = 0;
-        
-        for (auto& j : joints) {
-            j.targetAngle = 3.14f;
-            vec2 err = j.A->worldPoint(j.anchorA_local) - j.B->worldPoint(j.anchorB_local);
-            j.B->pos += err;
+    void reset(int idx) {
+        if (idx == 0){
+            rod1->pos = {250,200}; rod1->vel = {0,0}; rod1->angle = 3.14f/2.0f; rod1->angVel = 0;
         }
+        else if (idx == 1) {
+            rod2->pos = {250,200}; rod2->vel = {0,0}; rod2->angle = 3.14f/2.0f; rod2->angVel = 0;
+        }
+        joints[idx].targetAngle = 3.14f;
+        vec2 err = joints[idx].A->worldPoint(joints[idx].anchorA_local) - joints[idx].B->worldPoint(joints[idx].anchorB_local);
+        joints[idx].B->pos += err;
     }
     void checkBorderCollision(Bone* b) {
         float restitution = 0.2f, slop = 0.01f, percent = 0.8f, friction = 0.8f;
@@ -348,8 +347,7 @@ struct Data {
     WSADATA w;
     SOCKET sock, sendSock;
     sockaddr_in server, python;
-
-    float recvBuffer[1], stateBuffer[6];
+    float recvBuffer[2], stateBuffer[6];
     bool primed = false;
     Data() {
         WSAStartup(MAKEWORD(2,2), &w);
@@ -374,25 +372,28 @@ struct Data {
             return false;
         } else if (recvBuffer[0] == -100){
             return true;
-        } else if (recvBuffer[0] == -69){
-            sk->reset();
+        } else if (recvBuffer[0] == -69) { 
+            sk->reset((int)recvBuffer[1]);
         } else {
-            sk->joints[0].targetAngle = recvBuffer[0]+3.14f;
+            sk->joints[0].targetAngle = recvBuffer[0];
+            sk->joints[1].targetAngle = recvBuffer[1];
         }
 
         return false; 
     }
     void sendData(Skeleton* sk) {
         int i = 0;
-
-        float angle1   = sk->joints[0].B->angle - sk->joints[0].A->angle;
-        float angle2   = sk->joints[1].B->angle - sk->joints[1].A->angle;
-        stateBuffer[i++] =  sin(angle1);
-        stateBuffer[i++] =  cos(angle1);
-        stateBuffer[i++] =  sin(angle2);
-        stateBuffer[i++] =  cos(angle2);
-        stateBuffer[i++] =  sk->rod1->angVel;
-        stateBuffer[i++] =  sk->rod2->angVel;
+        for (Joint& j : sk->joints) {
+            float angle1   = j.B->angle - j.A->angle;
+            stateBuffer[i++] =  sin(angle1);
+            stateBuffer[i++] =  cos(angle1);
+            stateBuffer[i++] =  j.B->angVel;
+        }
+        // cout<<"Sending: ";
+        // for (int k = 0; k < i; k++) {
+        //     cout << stateBuffer[k] << " ";
+        // }
+        // cout << endl;
 
         sendto(sendSock, (char*)stateBuffer, i * sizeof(float), 0, (sockaddr*)&python, sizeof(python));
     }
@@ -408,9 +409,11 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
         float angle_delta = 0.1f; // Small adjustment in radians
         if (key == GLFW_KEY_LEFT) {
             figure->joints[0].targetAngle -= angle_delta;
+            figure->joints[1].targetAngle -= angle_delta;
             cout << "Joint 0 targetAngle: " << figure->joints[0].targetAngle << endl;
         } else if (key == GLFW_KEY_RIGHT) {
             figure->joints[0].targetAngle += angle_delta;
+            figure->joints[1].targetAngle -= angle_delta;
             cout << "Joint 0 targetAngle: " << figure->joints[0].targetAngle << endl;
         }
     }
@@ -419,8 +422,8 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
 int main() {
     Skeleton* figure = new Skeleton();
     Bone* dragBone=nullptr; vec2 dragOffset;
-    glfwSetWindowUserPointer(engine.window, figure); // Store the figure pointer for callbacks
-    glfwSetKeyCallback(engine.window, key_callback); // Register the new keyboard callback
+    glfwSetWindowUserPointer(engine.window, figure);
+    glfwSetKeyCallback(engine.window, key_callback);
     
     float dt = 1.0/60.0;
     double lastPrintTime = 0.0;
@@ -429,14 +432,14 @@ int main() {
         engine.run();
         
         // ------ RECIEVE DATA FROM PYTHON -------
-        //bool gotAction = dataManager.receiveData(figure);
+        bool gotAction = dataManager.receiveData(figure);
 
-        //if (gotAction) {
+        if (gotAction) {
             figure->step(dt);
             // ------ SEND DATA TO PYTHON -------
-            //dataManager.sendData(figure);
+            dataManager.sendData(figure);
             glfwSwapBuffers(engine.window);
-        //} 
+        } 
 
 
         //glfwSwapBuffers(engine.window);

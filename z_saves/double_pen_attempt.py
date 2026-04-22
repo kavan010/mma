@@ -15,7 +15,7 @@ class UDP:
         self.send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.send_addr = (ip, send_port)
 
-    def receive_state(self, num_floats=6):
+    def receive_state(self, num_floats=3):
         data, _ = self.recv_sock.recvfrom(num_floats * 4)
         return struct.unpack(f"{num_floats}f", data)
     def send_actions(self, actions):
@@ -33,36 +33,40 @@ udp = UDP("127.0.0.1", 5006, 5005)
 
 
 class Policy(nn.Module):
-    def __init__(self):
+    def __init__(self, state_dim=3, action_scale=math.pi):
         super().__init__()
+        self.action_scale = action_scale
         self.net = nn.Sequential(
-            nn.Linear(6, 64),
+            nn.Linear(state_dim, 128),
             nn.Tanh(),
-            nn.Linear(64, 64),
-            nn.Tanh(),
+            nn.Linear(128, 128),
+            nn.Tanh()
         )
-        self.mean = nn.Linear(64, 1)
-        self.log_std = nn.Parameter(torch.zeros(1))
+        self.mean = nn.Linear(128, 1)
+
+        self.log_std = nn.Parameter(torch.tensor(-0.5))  # stable init
 
     def forward(self, s):
         h = self.net(s)
         mean = self.mean(h)
-        std = torch.exp(self.log_std.clamp(-3, 0.5))
+        mean = torch.tanh(mean) * self.action_scale  # scale to [-π, π]
+
+        std = torch.exp(self.log_std.clamp(-5, 1))
+
         return Normal(mean, std)
 policy = Policy()
 opt = optim.Adam(policy.parameters(), lr=1e-4)
 
 
-
 class ValueNet(nn.Module):
-    def __init__(self):
+    def __init__(self, state_dim=3):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(6, 64),
+            nn.Linear(state_dim, 128),
             nn.Tanh(),
-            nn.Linear(64, 64),
+            nn.Linear(128, 128),
             nn.Tanh(),
-            nn.Linear(64, 1)
+            nn.Linear(128, 1)
         )
 
     def forward(self, s):
