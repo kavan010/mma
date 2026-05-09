@@ -67,3 +67,4 @@ while True:
     print(f"angles: {state[:, 0].tolist()}  actions: {action.flatten().tolist()}")
 
     time.sleep(0.3)
+
