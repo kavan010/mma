@@ -64,6 +64,5 @@ while True:
         action = dist.mean
 
     state = udp.step(action.flatten())
-    print(f"angles: {state[:, 0].tolist()}  actions: {action.flatten().tolist()}")
-
+    
     time.sleep(0.3)

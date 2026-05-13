@@ -7,16 +7,15 @@
 #include <cstdlib>
 #include <list>
 #include <vector>
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#pragma comment(lib, "ws2_32.lib")
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <unistd.h>
 using namespace glm; using namespace std;
 
-
 // ------------------------ Engine & Constants ----------------------
-int NUM_ENV = 2, STATE_DIM = 3;
+const int NUM_ENV = 3, STATE_DIM = 9, ACTION_DIM = 2;
 vec2 g(0.0f, -980.6f);
-vec2 mousePos; bool mouseDown = false;
 struct Engine {
     GLFWwindow* window;
     int WIDTH = 800, HEIGHT = 600;
@@ -60,32 +59,18 @@ struct Engine {
     }
 
     // ------ Callbacks ------
-    static void cursor_position_callback(GLFWwindow* window, double xpos, double ypos) {
-        int width, height;
-        glfwGetWindowSize(window, &width, &height);
-        mousePos = vec2(xpos, height - ypos);
+    vec2 rotate(vec2 v, float a) {
+        float c = cos(a), s = sin(a);
+        return vec2(c*v.x - s*v.y, s*v.x + c*v.y);
     }
-    static void mouse_button_callback(GLFWwindow* window, int button, int action, int mods) {
-        if (button == GLFW_MOUSE_BUTTON_LEFT) {
-            mouseDown = (action == GLFW_PRESS);
-        }
+    vec2 cross(float s, vec2 v) {
+        return vec2(-s*v.y, s*v.x);
     }
 };
 Engine engine;
 
 
 // ------------------------ Bodies & Physics ------------------------
-vec2 rotate(vec2 v, float a) {
-    float c = cos(a), s = sin(a);
-    return vec2(c*v.x - s*v.y, s*v.x + c*v.y);
-}
-float cross(vec2 a, vec2 b) {
-    return a.x*b.y - a.y*b.x;
-}
-vec2 cross(float s, vec2 v) {
-    return vec2(-s*v.y, s*v.x);
-}
-
 struct Bone {
     vec2 pos, vel;
     float angle, angVel;
@@ -149,14 +134,14 @@ struct Joint {
     void solve(float dt) {
         Bone* A = this->A; Bone* B = this->B;
 
-        vec2 rA = rotate(anchorA_local, A->angle), rB = rotate(anchorB_local, B->angle);
+        vec2 rA = engine.rotate(anchorA_local, A->angle), rB = engine.rotate(anchorB_local, B->angle);
         vec2 pA = A->pos + rA, pB = B->pos + rB;
 
         // position error
         vec2 C = pB - pA;
         // anchor velocities
-        vec2 vA = A->vel + cross(A->angVel, rA);
-        vec2 vB = B->vel + cross(B->angVel, rB);
+        vec2 vA = A->vel + engine.cross(A->angVel, rA);
+        vec2 vB = B->vel + engine.cross(B->angVel, rB);
 
         vec2 relVel = vB - vA;
 
@@ -182,8 +167,8 @@ struct Joint {
         A->vel -= impulse * A->invMass;
         B->vel += impulse * B->invMass;
 
-        A->angVel -= cross(rA, impulse) * A->invInertia;
-        B->angVel += cross(rB, impulse) * B->invInertia;
+        A->angVel -= engine.cross(rA, impulse) * A->invInertia;
+        B->angVel += engine.cross(rB, impulse) * B->invInertia;
     }
     void applyTorque(float dt) {
 
@@ -192,9 +177,9 @@ struct Joint {
         float error   = targetAngle - angle;
 
         float k = stiffness * maxTorque;
-        //float d = 2.0f * sqrt(k * (A->inertia + B->inertia));  // critical damping
+        float d = 2.0f * sqrt(k * (A->inertia + B->inertia));  // critical damping
 
-        float torque  = k * error;
+        float torque  = k * error - d * angVel;
 
         // clamp to maxTorque so it cant explode
         torque = glm::clamp(torque, -maxTorque, maxTorque);
@@ -211,21 +196,21 @@ struct Skeleton {
     vector<Bone*> bones;
     vector<Joint> joints;
 
-    Bone *rod1, *rod2, *ground;
+    Bone *legR, *legL, *hip;
 
-    Skeleton(){ init(); }
+    Skeleton(vec2 p) { init(p); }
 
-    void init() {
+    void init(vec2 p) {
         // ---- Bones ----
-        rod1     = new Bone({250,200},-3.14f/2.0f,40,5,7);
-        rod2     = new Bone({250,200},3.14f/2.0f,40,5,7);
-        ground = new Bone({400,300},-3.14f/2.0f,2,1,70000);
+        legR    = new Bone(p, 3.14f/3.0f,  25, 5, 7.0f);
+        legL    = new Bone(p, 3.14f/1.0f, 25, 5, 7.0f);
+        hip     = new Bone(p, 0.0f, 35, 18, 10.0f);
 
-        bones = {rod1,rod2,ground};
+        bones = {legL,legR,hip};
 
         // Joints 
-        joints.push_back(Joint(ground,rod1,{0,0},{-rod1->halfLength,0}, 0.0f, 1.0f));
-        joints.push_back(Joint(ground,rod2,{0,0},{-rod2->halfLength,0}, 0.0f, 1.0f));
+        joints.push_back(Joint(hip,legR, {-hip->halfLength*0.71f,-hip->radius*0.71f}, {legR->halfLength,0}, 0.35f));
+        joints.push_back(Joint(hip,legL, { hip->halfLength*0.71f,-hip->radius*0.71f}, {legL->halfLength,0}, 3.14f-0.35f));
 
 
         // Initial constraint alignment
@@ -238,12 +223,7 @@ struct Skeleton {
     void step(float dt) {
         // ---- Euler Integrate Gravity & Draw ----
         for (Bone* b : bones) {
-            if (b != ground)
             b->vel += g * dt;
-            else {
-                b->vel=vec2(0.0f);
-                b->angVel=0.0f;
-            }
             b->vel    *= 1.0f / (1.0f + 0.7f * dt);
             b->angVel *= 1.0f / (1.0f + 0.7f * dt);
             b->draw();
@@ -257,24 +237,18 @@ struct Skeleton {
         }
         // ---- Euler Integrate ----
         for (Bone* b : bones) {
-            if (b != ground)
-                b->pos += b->vel * dt;\
-                b->angVel = glm::clamp(b->angVel, -50.0f, 50.0f);
-            if (b != ground)
+            b->pos += b->vel * dt;\
+            b->angVel = glm::clamp(b->angVel, -50.0f, 50.0f);
             b->angle += b->angVel * dt;
             checkBorderCollision(b);
         }
     }
-    void reset(int idx) {
-        if (idx == 0){
-            rod1->pos = {250,200}; rod1->vel = {0,0}; rod1->angle = 3.14f/2.0f; rod1->angVel = 0;
+    void reset() {
+        for (int idx = 0; idx < joints.size(); idx++) {
+            joints[idx].targetAngle = 3.14f;
+            vec2 err = joints[idx].A->worldPoint(joints[idx].anchorA_local) - joints[idx].B->worldPoint(joints[idx].anchorB_local);
+            joints[idx].B->pos += err;
         }
-        else if (idx == 1) {
-            rod2->pos = {250,200}; rod2->vel = {0,0}; rod2->angle = 3.14f/2.0f; rod2->angVel = 0;
-        }
-        joints[idx].targetAngle = 3.14f;
-        vec2 err = joints[idx].A->worldPoint(joints[idx].anchorA_local) - joints[idx].B->worldPoint(joints[idx].anchorB_local);
-        joints[idx].B->pos += err;
     }
     void checkBorderCollision(Bone* b) {
         float restitution = 0.2f, slop = 0.01f, percent = 0.8f, friction = 0.8f;
@@ -314,12 +288,12 @@ struct Skeleton {
             vec2 r = contact - b->pos;
 
             // velocity at contact
-            vec2 vel = b->vel + cross(b->angVel, r);
+            vec2 vel = b->vel + engine.cross(b->angVel, r);
 
             float velAlongNormal = dot(vel, normal);
             if (velAlongNormal > 0) continue;
 
-            float rCrossN = cross(r, normal);
+            float rCrossN = engine.cross(r, normal);
             float denom = b->invMass + (rCrossN * rCrossN) * b->invInertia;
             if (denom == 0) continue;
 
@@ -328,7 +302,7 @@ struct Skeleton {
 
             vec2 impulse = normal * jn;
             b->vel += impulse * b->invMass;
-            b->angVel += cross(r, impulse) * b->invInertia;
+            b->angVel += engine.cross(r, impulse) * b->invInertia;
 
             b->vel.x *= friction;
             b->vel.y *= 0.8f;
@@ -339,24 +313,29 @@ struct Skeleton {
         }
     }
 };
+vector<Skeleton*> envs {
+    new Skeleton(vec2(400,150)),
+    new Skeleton(vec2(200,150)),
+    new Skeleton(vec2(600,150))
+};
 
 
 // ------------------------ File Connections ------------------------
 struct Data {
-    // Sockets
-    WSADATA w;
-    SOCKET sock, sendSock;
+    int sock, sendSock;
     sockaddr_in server, python;
-    float recvBuffer[2], stateBuffer[6];
+    const static int revSize = NUM_ENV * ACTION_DIM;
+    const static int sendSize = NUM_ENV * STATE_DIM;
+
+    float recvBuffer[revSize], stateBuffer[sendSize];
     bool primed = false;
     Data() {
-        WSAStartup(MAKEWORD(2,2), &w);
         sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         sendSock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 
         server.sin_family = AF_INET;
         server.sin_port = htons(5005);
-        server.sin_addr.S_un.S_addr = INADDR_ANY;
+        server.sin_addr.s_addr = INADDR_ANY;
 
         python.sin_family = AF_INET;
         python.sin_port = htons(5006);
@@ -365,84 +344,67 @@ struct Data {
         bind(sock, (sockaddr*)&server, sizeof(server));
     }
     
-    bool receiveData(Skeleton* sk) {
+    bool receiveData() {
         int bytesRead = recv(sock, (char*)recvBuffer, sizeof(recvBuffer), 0);
 
-        if (bytesRead != sizeof(recvBuffer)) {
-            return false;
-        } else if (recvBuffer[0] == -100){
-            return true;
-        } else if (recvBuffer[0] == -69) { 
-            sk->reset((int)recvBuffer[1]);
-        } else {
-            sk->joints[0].targetAngle = recvBuffer[0];
-            sk->joints[1].targetAngle = recvBuffer[1];
-        }
+        if (bytesRead < (int)(2 * sizeof(float))) return false;
 
-        return false; 
-    }
-    void sendData(Skeleton* sk) {
-        int i = 0;
-        for (Joint& j : sk->joints) {
-            float angle1   = j.B->angle - j.A->angle;
-            stateBuffer[i++] =  sin(angle1);
-            stateBuffer[i++] =  cos(angle1);
-            stateBuffer[i++] =  j.B->angVel;
+        if (recvBuffer[0] == -100.0f) {
+            return true; // python is asking for state
+        } else if (recvBuffer[0] == -69.0f) {
+            envs[(int)recvBuffer[1]]->reset();
+            return false;
+        } else if (bytesRead == (int)sizeof(recvBuffer)) {
+            int i = 0;
+            for (Skeleton* env : envs) {
+                env->joints[0].targetAngle = recvBuffer[i++];
+                env->joints[1].targetAngle = recvBuffer[i++];
+            }
         }
-        // cout<<"Sending: ";
-        // for (int k = 0; k < i; k++) {
-        //     cout << stateBuffer[k] << " ";
-        // }
-        // cout << endl;
+        return false;
+    }
+    void sendData() {
+        int i = 0;
+        for (Skeleton* env : envs) {
+            stateBuffer[i++] = sin(env->hip->angle);
+            stateBuffer[i++] = cos(env->hip->angle);
+            stateBuffer[i++] = env->hip->angVel;
+            stateBuffer[i++] = sin(env->legR->angle);
+            stateBuffer[i++] = cos(env->legR->angle);
+            stateBuffer[i++] = env->legR->angVel;
+            stateBuffer[i++] = sin(env->legL->angle);
+            stateBuffer[i++] = cos(env->legL->angle);
+            stateBuffer[i++] = env->legL->angVel;
+        }
 
         sendto(sendSock, (char*)stateBuffer, i * sizeof(float), 0, (sockaddr*)&python, sizeof(python));
     }
 };
 Data dataManager;
 
-// ------ Keyboard Callback ------
-static void key_callback(GLFWwindow* window, int key, int scancode, int action, int mods) {
-    if (action == GLFW_PRESS || action == GLFW_REPEAT) {
-        // Retrieve the Skeleton object associated with the window
-        Skeleton* figure = static_cast<Skeleton*>(glfwGetWindowUserPointer(window));
-        if (!figure) return;
-        float angle_delta = 0.1f; // Small adjustment in radians
-        if (key == GLFW_KEY_LEFT) {
-            figure->joints[0].targetAngle -= angle_delta;
-            figure->joints[1].targetAngle -= angle_delta;
-            cout << "Joint 0 targetAngle: " << figure->joints[0].targetAngle << endl;
-        } else if (key == GLFW_KEY_RIGHT) {
-            figure->joints[0].targetAngle += angle_delta;
-            figure->joints[1].targetAngle -= angle_delta;
-            cout << "Joint 0 targetAngle: " << figure->joints[0].targetAngle << endl;
-        }
-    }
-}
+
 // ------------------------ MAIN ------------------------
 int main() {
-    Skeleton* figure = new Skeleton();
-    Bone* dragBone=nullptr; vec2 dragOffset;
-    glfwSetWindowUserPointer(engine.window, figure);
-    glfwSetKeyCallback(engine.window, key_callback);
     
     float dt = 1.0/60.0;
     double lastPrintTime = 0.0;
     glfwSwapBuffers(engine.window);
     while(!glfwWindowShouldClose(engine.window)) {
         engine.run();
-        
+
         // ------ RECIEVE DATA FROM PYTHON -------
-        bool gotAction = dataManager.receiveData(figure);
+        //bool gotAction = dataManager.receiveData();
 
-        if (gotAction) {
-            figure->step(dt);
-            // ------ SEND DATA TO PYTHON -------
-            dataManager.sendData(figure);
-            glfwSwapBuffers(engine.window);
-        } 
+        for (Skeleton* env : envs) {
+            env->step(dt);
+        }
 
+        // ------ SEND DATA TO PYTHON -------
+        //if (gotAction) {
+        //    dataManager.sendData();
+        //}
 
-        //glfwSwapBuffers(engine.window);
+        glfwSwapBuffers(engine.window);
         glfwPollEvents();
     }
 

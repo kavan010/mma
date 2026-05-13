@@ -7,14 +7,15 @@ import socket
 import struct
 from time import sleep
 
-NUM_ENVS = 2
-state_dim = 3
+NUM_ENVS = 3
+action_dim = 2
+state_dim = 9
 
 MAX_ANGLE = math.pi
 
 
 class ActorCritic(nn.Module):
-    def __init__(self, state_dim=3, hidden=128):
+    def __init__(self, hidden=128):
         super().__init__()
 
         self.shared = nn.Sequential(
@@ -25,8 +26,8 @@ class ActorCritic(nn.Module):
         )
 
         # policy head
-        self.mean = nn.Linear(hidden, 1)
-        self.log_std = nn.Parameter(torch.zeros(1))
+        self.mean = nn.Linear(hidden, action_dim)
+        self.log_std = nn.Parameter(torch.zeros(action_dim))
 
         # value head
         self.value = nn.Linear(hidden, 1)
@@ -65,7 +66,6 @@ class RolloutBuffer:
         self.dones.append(done.float())
         self.log_probs.append(log_prob)
         self.values.append(value.squeeze(-1))
-
     def compute_gae(self, last_value, gamma=0.99, lam=0.95):
         last_v = last_value.squeeze(-1)
         values = self.values + [last_v]
@@ -90,20 +90,27 @@ buffer = RolloutBuffer()
 
 
 def getReward(state):
-    sin1 = state[:,0]
-    cos1 = state[:,1]
-    angVel = state[:,2]
-    theta1 = torch.atan2(sin1, cos1)
-    err1 = torch.atan2(torch.sin(theta1 - math.pi), torch.cos(theta1 - math.pi))
-    r = torch.cos(err1)
-    r -= 0.01 * angVel**2
-    return r
+    # state indices: 0:sin(h), 1:cos(h), 2:h_vel, 3:sin(r), 4:cos(r), 5:r_vel, 6:sin(l), 7:cos(l), 8:l_vel
+    hip_angle = torch.atan2(state[:, 0], state[:, 1])
+    
+    # 1. Torso orientation: Reward keeping the hip horizontal (angle 0)
+    upright_reward = torch.cos(hip_angle)
+    
+    # 2. Stability: Penalize hip rotation speed to reduce oscillation
+    stability_penalty = 0.02 * state[:, 2]**2
+    
+    # 3. Coordination: Penalize excessive leg velocity to prevent "flailing"
+    leg_penalty = 0.005 * (state[:, 5]**2 + state[:, 8]**2)
+    
+    # 4. Survival: Give a constant bonus for not falling over
+    return upright_reward - stability_penalty - leg_penalty + 0.1
+
 def isDone(state):
-    sin1 = state[:,0]
-    cos1 = state[:,1]
-    theta1 = torch.atan2(sin1, cos1)
-    err1 = torch.atan2(torch.sin(theta1 - math.pi), torch.cos(theta1 - math.pi))
-    return (torch.abs(err1) > 2.5)
+    hip_angle = torch.atan2(state[:, 0], state[:, 1])
+    done = torch.abs(hip_angle) > 0.8
+    if done.any():
+        print("fail: " + str(hip_angle))
+    return done
 
 class UDP:
     def __init__(self, ip, recv_port, send_port):
@@ -129,14 +136,17 @@ class UDP:
         flat = torch.tensor(self.receive_state(), dtype=torch.float32)
         s = flat.view(NUM_ENVS, state_dim)  
         return s, getReward(s), isDone(s)
+    def send_reset(self, env_idx):
+        self.send_actions([-69.0, float(env_idx)])
 udp = UDP("127.0.0.1", 5006, 5005)
 
 
 
-N = 500
-T = 256
+N = 10
+T = 10
 K_epochs = 10
 state_batch = udp.get_state()
+print(state_batch)
 
 for iteration in range(N):
     buffer.clear()
@@ -156,7 +166,7 @@ for iteration in range(N):
         # reset envs
         for i in range(NUM_ENVS):
             if done[i]:
-                udp.send_actions([-69.0, i])
+                udp.send_reset(i)
         state_batch = next_state
         if done.any():
             fresh = udp.get_state()
@@ -164,7 +174,7 @@ for iteration in range(N):
                 if done[i]:
                     state_batch[i] = fresh[i]
 
-        #sleep(0.1)
+        sleep(0.5)
 
 
     # run again to get final prediction
@@ -208,7 +218,8 @@ for iteration in range(N):
         opt.step()
 
         if epoch == K_epochs - 1:
-            print(f"  loss: {loss.item():.2f} | actor: {actor_loss.item():.3f} | critic: {critic_loss.item():.3f} | std: {torch.exp(model.log_std).item():.3f}")
+            print(f"  loss: {loss.item():.2f} | actor: {actor_loss.item():.3f} | critic: {critic_loss.item():.3f} | std: {torch.exp(model.log_std).tolist()}")
 
 
-torch.save(model.state_dict(), "SINGLE_PENDULUM_POLICY.pt")
+
+#torch.save(model.state_dict(), "TORSO_BALANCING_POLICY.pt")
