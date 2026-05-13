@@ -5,6 +5,106 @@ import torch.optim as optim
 import math
 import socket
 import struct
+from time import sleep
+
+NUM_ENVS = 2
+action_dim = 2
+state_dim = 9
+
+MAX_ANGLE = math.pi
+
+
+class ActorCritic(nn.Module):
+    def __init__(self, state_dim=3, hidden=128):
+        super().__init__()
+
+        self.shared = nn.Sequential(
+            nn.Linear(state_dim, hidden),
+            nn.Tanh(),
+            nn.Linear(hidden, hidden),
+            nn.Tanh(),
+        )
+
+        # policy head
+        self.mean = nn.Linear(hidden, action_dim)
+        self.log_std = nn.Parameter(torch.zeros(action_dim))
+
+        # value head
+        self.value = nn.Linear(hidden, 1)
+
+    def forward(self, s):
+        h = self.shared(s)
+
+        # ---- policy ----
+        mean = torch.tanh(self.mean(h)) * MAX_ANGLE
+        std = torch.exp(self.log_std.clamp(-3, 0.5))
+        dist = Normal(mean, std)
+
+        # ---- value ----
+        value = self.value(h)
+
+        return dist, value
+model = ActorCritic()
+opt = optim.Adam(model.parameters(), lr=1e-4)
+
+
+class RolloutBuffer:
+    def __init__(self):
+        self.states = []
+        self.actions = []
+        self.rewards = []
+        self.dones = []
+        self.log_probs = []
+        self.values = []
+        self.advantages = []
+        self.returns = []
+
+    def store(self, state, action, reward, done, log_prob, value):
+        self.states.append(state)
+        self.actions.append(action)
+        self.rewards.append(reward)
+        self.dones.append(done.float())
+        self.log_probs.append(log_prob)
+        self.values.append(value.squeeze(-1))
+
+    def compute_gae(self, last_value, gamma=0.99, lam=0.95):
+        last_v = last_value.squeeze(-1)
+        values = self.values + [last_v]
+
+        gae = torch.zeros(NUM_ENVS)
+        adv = []
+
+        for t in reversed(range(len(self.rewards))):
+            mask = 1.0 - self.dones[t]
+            # check with future state if prediction was opt or pess
+            delta = self.rewards[t] + gamma * values[t+1] * mask - values[t]
+            # check over time
+            gae = delta + gamma * lam * mask * gae
+            adv.insert(0, gae)
+
+        self.advantages = adv
+        self.returns = [a + v for a, v in zip(adv, self.values)]
+
+    def clear(self):
+        self.__init__()
+buffer = RolloutBuffer()
+
+
+def getReward(state):
+    sin1 = state[:,0]
+    cos1 = state[:,1]
+    angVel = state[:,2]
+    theta1 = torch.atan2(sin1, cos1)
+    err1 = torch.atan2(torch.sin(theta1 - math.pi), torch.cos(theta1 - math.pi))
+    r = torch.cos(err1)
+    r -= 0.01 * angVel**2
+    return r
+def isDone(state):
+    sin1 = state[:,0]
+    cos1 = state[:,1]
+    theta1 = torch.atan2(sin1, cos1)
+    err1 = torch.atan2(torch.sin(theta1 - math.pi), torch.cos(theta1 - math.pi))
+    return (torch.abs(err1) > 2.5)
 
 class UDP:
     def __init__(self, ip, recv_port, send_port):
@@ -13,101 +113,104 @@ class UDP:
         self.send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.send_addr = (ip, send_port)
 
-    def receive_state(self, num_floats=6):
+    def receive_state(self, num_floats=state_dim * NUM_ENVS):
         data, _ = self.recv_sock.recvfrom(num_floats * 4)
         return struct.unpack(f"{num_floats}f", data)
     def send_actions(self, actions):
         self.send_sock.sendto(struct.pack(f"{len(actions)}f", *actions), self.send_addr)
+    
+    def get_state(self):
+        self.send_actions([-100.0, -100.0])
+        flat = torch.tensor(self.receive_state(), dtype=torch.float32)
+        s = flat.view(NUM_ENVS, state_dim)  
+        return s
+    def step(self, target_angle):
+        self.send_actions(target_angle.tolist())
+        self.send_actions([-100.0, -100.0])
+        flat = torch.tensor(self.receive_state(), dtype=torch.float32)
+        s = flat.view(NUM_ENVS, state_dim)  
+        return s, getReward(s), isDone(s)
 udp = UDP("127.0.0.1", 5006, 5005)
 
-class Policy(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(6, 64),
-            nn.Tanh(),
-            nn.Linear(64, 64),
-            nn.Tanh(),
-        )
-        self.mean = nn.Linear(64, 1)
-        self.log_std = nn.Parameter(torch.zeros(1))
-    def forward(self, s):
-        h = self.net(s)
-        mean = self.mean(h)
-        std = self.log_std.exp()
-        return Normal(mean, std)
-
-def get_state():
-    udp.send_actions([-100.0])
-    angle1, angVel1, angle2, angVel2, x, y = udp.receive_state()
-    s = torch.tensor([angle1, angVel1, angle2, angVel2, x, y], dtype=torch.float32)
-    return s
-def step(target_angle):
-    udp.send_actions([target_angle])
-    udp.send_actions([-100.0])
-    angle1, angVel1, angle2, angVel2, x, y = udp.receive_state()
-    s = torch.tensor([angle1, angVel1, angle2, angVel2, x, y], dtype=torch.float32)
-    return s
-# def reward(state):
-#     joint_y = state[4].item()
-#     tip_y   = state[5].item()
-#     return -(1-tip_y)*10.0
-def is_failed(state):
-    return state[5].item() < state[4].item()
-def reward(state):
-    tip_angle = state[2].item() * 6.28  # unnormalize
-    upright_error = tip_angle - (math.pi / 2)
-    reward = math.cos(upright_error)  # -1 when fallen, +1 when upright
-    reward += 0.1  # survival bonus per timestep
-    reward -= 0.001 * action**2  # small action penalty to discourage jitter
-
-policy = Policy()
-opt = optim.Adam(policy.parameters(), lr=1e-4)
 
 
-for episode in range(10000):
-    log_probs = []
-    rewards = []
-    state = get_state()
-    for t in range(400):
-        dist = policy(state)
+N = 1
+T = 100
+K_epochs = 10
+state_batch = udp.get_state()
+print(state_batch)
+
+for iteration in range(N):
+    buffer.clear()
+
+    # data collection (run the sim for T steps)
+    for t in range(T):
+        with torch.no_grad():
+            dist, value = model(state_batch)
         action = dist.sample()
         log_prob = dist.log_prob(action)
 
-        target_angle = float(torch.remainder(action, 2*math.pi))
-        next_state = step(target_angle)
-        log_probs.append(log_prob)
+        # step and store data
+        action_np = action.detach().numpy().flatten()
+        next_state, reward, done = udp.step(action_np)
+        buffer.store(state_batch, action, reward, done, log_prob, value)
 
-        if is_failed(next_state):
-            fall_penalty = -15.0 * (1 + (400 - t) / 200)   # range -5 to -10
-            rewards.append(fall_penalty)
-            udp.send_actions([-69.0])
-            break
+        # reset envs
+        for i in range(NUM_ENVS):
+            if done[i]:
+                udp.send_actions([-69.0, i])
+        state_batch = next_state
+        if done.any():
+            fresh = udp.get_state()
+            for i in range(NUM_ENVS):
+                if done[i]:
+                    state_batch[i] = fresh[i]
 
-        rewards.append(reward(next_state))
-        state = next_state
-
-    if len(log_probs) < 2:
-        print(f"EP: {episode}, skipped")
-        continue
-
-    returns = []
-    G = 0
-    for r in reversed(rewards):
-        G = r + 0.99 * G
-        returns.insert(0, G)
-    returns = torch.tensor(returns, dtype=torch.float32)
-    returns = (returns - returns.mean()) / (returns.std() + 1e-8)
-
-    loss = sum(-lp * G for lp, G in zip(log_probs, returns)) / len(log_probs)
-    opt.zero_grad()
-    loss.backward()
-    torch.nn.utils.clip_grad_norm_(policy.parameters(), 0.5)
-    opt.step()
-
-    print(f"EP: {episode}, Steps: {len(log_probs)}, Avg Reward: {sum(rewards)/len(rewards):.4f}")
-
-torch.save(policy.state_dict(), "double_pendulum_policy.pt")
+        #sleep(0.1)
 
 
+    # run again to get final prediction
+    avg_reward = torch.stack(buffer.rewards).mean().item()
+    with torch.no_grad():
+        _, last_value = model(state_batch)
+    buffer.compute_gae(last_value)
+    print(f"[{iteration}] reward: {avg_reward:.3f} | advantages mean: {torch.stack(buffer.advantages).mean().item():.3f}")
 
+
+    # model update
+    clip_eps = 0.2
+
+    for epoch in range(K_epochs):
+        states        = torch.stack(buffer.states)
+        actions       = torch.stack(buffer.actions)
+        old_log_probs = torch.stack(buffer.log_probs)
+        advantages    = torch.stack(buffer.advantages)
+        returns       = torch.stack(buffer.returns)
+
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        dist, values  = model(states)
+        new_log_probs = dist.log_prob(actions)
+        entropy       = dist.entropy()
+
+        ratio          = torch.exp(new_log_probs - old_log_probs)
+        clipped_ratio  = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps)
+        actor_loss     = -torch.min(ratio * advantages.unsqueeze(-1), clipped_ratio * advantages.unsqueeze(-1)).mean()
+
+        critic_loss    = nn.MSELoss()(values.squeeze(-1), returns)
+
+        entropy_loss   = -entropy.mean()
+
+        loss = actor_loss + 0.5 * critic_loss + 0.01 * entropy_loss
+        print("loss:", loss.item())
+
+        opt.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+        opt.step()
+
+        if epoch == K_epochs - 1:
+            print(f"  loss: {loss.item():.2f} | actor: {actor_loss.item():.3f} | critic: {critic_loss.item():.3f} | std: {torch.exp(model.log_std).item():.3f}")
+
+
+#torch.save(model.state_dict(), "TORSO_BALANCING_POLICY.pt")
