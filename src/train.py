@@ -9,7 +9,7 @@ from time import sleep
 
 NUM_ENVS = 3
 action_dim = 2
-state_dim = 9
+state_dim = 10
 
 MAX_ANGLE = math.pi
 
@@ -27,7 +27,7 @@ class ActorCritic(nn.Module):
 
         # policy head
         self.mean = nn.Linear(hidden, action_dim)
-        self.log_std = nn.Parameter(torch.zeros(action_dim))
+        self.log_std = nn.Parameter(torch.ones(action_dim) * 0.5)
 
         # value head
         self.value = nn.Linear(hidden, 1)
@@ -36,7 +36,7 @@ class ActorCritic(nn.Module):
         h = self.shared(s)
 
         # ---- policy ----
-        mean = torch.tanh(self.mean(h)) * MAX_ANGLE
+        mean = self.mean(h)
         std = torch.exp(self.log_std.clamp(-3, 0.5))
         dist = Normal(mean, std)
 
@@ -90,26 +90,29 @@ buffer = RolloutBuffer()
 
 
 def getReward(state):
-    # state indices: 0:sin(h), 1:cos(h), 2:h_vel, 3:sin(r), 4:cos(r), 5:r_vel, 6:sin(l), 7:cos(l), 8:l_vel
-    hip_angle = torch.atan2(state[:, 0], state[:, 1])
-    
-    # 1. Torso orientation: Reward keeping the hip horizontal (angle 0)
-    upright_reward = torch.cos(hip_angle)
-    
-    # 2. Stability: Penalize hip rotation speed to reduce oscillation
-    stability_penalty = 0.02 * state[:, 2]**2
-    
-    # 3. Coordination: Penalize excessive leg velocity to prevent "flailing"
-    leg_penalty = 0.005 * (state[:, 5]**2 + state[:, 8]**2)
-    
-    # 4. Survival: Give a constant bonus for not falling over
-    return upright_reward - stability_penalty - leg_penalty + 0.1
+    hip_angle  = torch.atan2(state[:, 0], state[:, 1])
+    hip_y_norm = state[:, 9] / 0.11
+
+    # --- Normalize angle to [0,1]
+    angle_norm = (torch.cos(hip_angle) + 1) / 2
+
+    # --- Normalize height to [0,1] using known range
+    height_norm = (hip_y_norm - 0.27) / (1.10 - 0.27)
+    height_norm = torch.clamp(height_norm, 0.0, 1.0)
+
+    # --- True 60 / 40 mix
+    main_reward = 0.6 * angle_norm + 0.4 * height_norm
+    main_reward = main_reward - 0.7
+
+    # --- Penalties
+    stability_penalty = 0.02 * state[:, 2] ** 2
+    leg_penalty = 0.005 * (state[:, 5] ** 2 + state[:, 8] ** 2)
+
+    return main_reward - stability_penalty - leg_penalty
 
 def isDone(state):
     hip_angle = torch.atan2(state[:, 0], state[:, 1])
     done = torch.abs(hip_angle) > 0.8
-    if done.any():
-        print("fail: " + str(hip_angle))
     return done
 
 class UDP:
@@ -142,24 +145,27 @@ udp = UDP("127.0.0.1", 5006, 5005)
 
 
 
-N = 10
-T = 10
+N = 500
+T = 1024
 K_epochs = 10
 state_batch = udp.get_state()
-print(state_batch)
 
+    
+
+print("Starting training loop...")
 for iteration in range(N):
     buffer.clear()
 
-    # data collection (run the sim for T steps)
+
+    # --- data collection ---
     for t in range(T):
         with torch.no_grad():
             dist, value = model(state_batch)
         action = dist.sample()
-        log_prob = dist.log_prob(action)
+        log_prob = dist.log_prob(action).sum(-1)
 
         # step and store data
-        action_np = action.detach().numpy().flatten()
+        action_np = torch.clamp(action, -MAX_ANGLE, MAX_ANGLE).detach().numpy().flatten()
         next_state, reward, done = udp.step(action_np)
         buffer.store(state_batch, action, reward, done, log_prob, value)
 
@@ -174,10 +180,8 @@ for iteration in range(N):
                 if done[i]:
                     state_batch[i] = fresh[i]
 
-        sleep(0.5)
 
-
-    # run again to get final prediction
+    # --- advantage estimation ---
     avg_reward = torch.stack(buffer.rewards).mean().item()
     with torch.no_grad():
         _, last_value = model(state_batch)
@@ -185,9 +189,8 @@ for iteration in range(N):
     print(f"[{iteration}] reward: {avg_reward:.3f} | advantages mean: {torch.stack(buffer.advantages).mean().item():.3f}")
 
 
-    # model update
+    # --- model update ---
     clip_eps = 0.2
-
     for epoch in range(K_epochs):
         states        = torch.stack(buffer.states)
         actions       = torch.stack(buffer.actions)
@@ -195,18 +198,25 @@ for iteration in range(N):
         advantages    = torch.stack(buffer.advantages)
         returns       = torch.stack(buffer.returns)
 
+        # ---- FLATTEN HERE ----
+        T_roll, Nenv, S = states.shape
+
+        states        = states.view(T_roll * Nenv, S)
+        actions       = actions.view(T_roll * Nenv, action_dim)
+        old_log_probs = old_log_probs.view(T_roll * Nenv)
+        advantages    = advantages.view(T_roll * Nenv)
+        returns       = returns.view(T_roll * Nenv)
+
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         dist, values  = model(states)
-        new_log_probs = dist.log_prob(actions)
-        entropy       = dist.entropy()
+        new_log_probs = dist.log_prob(actions).sum(-1)
+        entropy       = dist.entropy().sum(-1)
 
         ratio          = torch.exp(new_log_probs - old_log_probs)
         clipped_ratio  = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps)
-        actor_loss     = -torch.min(ratio * advantages.unsqueeze(-1), clipped_ratio * advantages.unsqueeze(-1)).mean()
-
+        actor_loss = -torch.min(ratio * advantages, clipped_ratio * advantages).mean()
         critic_loss    = nn.MSELoss()(values.squeeze(-1), returns)
-
         entropy_loss   = -entropy.mean()
 
         loss = actor_loss + 0.5 * critic_loss + 0.01 * entropy_loss
@@ -222,4 +232,19 @@ for iteration in range(N):
 
 
 
-#torch.save(model.state_dict(), "TORSO_BALANCING_POLICY.pt")
+torch.save(model.state_dict(), "TORSO_BALANCING_POLICY.pt")
+
+
+
+
+# test loop 
+# while True:
+#     udp.send_actions([-100.0, -100.0])
+#     flat = torch.tensor(udp.receive_state(), dtype=torch.float32)
+#     state_batch = flat.view(NUM_ENVS, state_dim)   # update state_batch!
+#     print("reward: ", getReward(state_batch))
+#     done = isDone(state_batch)
+#     for i in range(NUM_ENVS):
+#         if done[i]:
+#             print(f"env {i} done, resetting")
+#             udp.send_reset(i)

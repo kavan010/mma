@@ -14,7 +14,7 @@
 using namespace glm; using namespace std;
 
 // ------------------------ Engine & Constants ----------------------
-const int NUM_ENV = 3, STATE_DIM = 9, ACTION_DIM = 2;
+const int NUM_ENV = 1, STATE_DIM = 10, ACTION_DIM = 2;
 vec2 g(0.0f, -980.6f);
 struct Engine {
     GLFWwindow* window;
@@ -195,12 +195,15 @@ struct Joint {
 struct Skeleton {
     vector<Bone*> bones;
     vector<Joint> joints;
+    vec2 startPos;
 
     Bone *legR, *legL, *hip;
 
-    Skeleton(vec2 p) { init(p); }
+    Skeleton(vec2 p) : startPos(p) { init(p); }
 
     void init(vec2 p) {
+        for(auto b : bones) delete b;
+        joints.clear();
         // ---- Bones ----
         legR    = new Bone(p, 3.14f/3.0f,  25, 5, 7.0f);
         legL    = new Bone(p, 3.14f/1.0f, 25, 5, 7.0f);
@@ -244,11 +247,7 @@ struct Skeleton {
         }
     }
     void reset() {
-        for (int idx = 0; idx < joints.size(); idx++) {
-            joints[idx].targetAngle = 3.14f;
-            vec2 err = joints[idx].A->worldPoint(joints[idx].anchorA_local) - joints[idx].B->worldPoint(joints[idx].anchorB_local);
-            joints[idx].B->pos += err;
-        }
+        init(startPos);
     }
     void checkBorderCollision(Bone* b) {
         float restitution = 0.2f, slop = 0.01f, percent = 0.8f, friction = 0.8f;
@@ -314,9 +313,9 @@ struct Skeleton {
     }
 };
 vector<Skeleton*> envs {
-    new Skeleton(vec2(400,150)),
+    // new Skeleton(vec2(400,150)),
     new Skeleton(vec2(200,150)),
-    new Skeleton(vec2(600,150))
+    // new Skeleton(vec2(600,150))
 };
 
 
@@ -366,15 +365,19 @@ struct Data {
     void sendData() {
         int i = 0;
         for (Skeleton* env : envs) {
+            float relR = env->legR->angle - env->hip->angle;
+            float relL = env->legL->angle - env->hip->angle;
+
             stateBuffer[i++] = sin(env->hip->angle);
             stateBuffer[i++] = cos(env->hip->angle);
             stateBuffer[i++] = env->hip->angVel;
-            stateBuffer[i++] = sin(env->legR->angle);
-            stateBuffer[i++] = cos(env->legR->angle);
+            stateBuffer[i++] = sin(relR);
+            stateBuffer[i++] = cos(relR);
             stateBuffer[i++] = env->legR->angVel;
-            stateBuffer[i++] = sin(env->legL->angle);
-            stateBuffer[i++] = cos(env->legL->angle);
+            stateBuffer[i++] = sin(relL);
+            stateBuffer[i++] = cos(relL);
             stateBuffer[i++] = env->legL->angVel;
+            stateBuffer[i++] = env->hip->pos.y / 600.0f;
         }
 
         sendto(sendSock, (char*)stateBuffer, i * sizeof(float), 0, (sockaddr*)&python, sizeof(python));
@@ -382,6 +385,22 @@ struct Data {
 };
 Data dataManager;
 
+void tempKeyControl(GLFWwindow* w) {
+    float delta_angle = 0.05f;
+
+    // Control left leg (joints[1]) with left/right arrows
+    if (glfwGetKey(w, GLFW_KEY_LEFT) == GLFW_PRESS) {
+        for (auto* e : envs) e->joints[1].targetAngle -= delta_angle;
+    } else if (glfwGetKey(w, GLFW_KEY_RIGHT) == GLFW_PRESS) {
+        for (auto* e : envs) e->joints[1].targetAngle += delta_angle;
+    }
+    // Control right leg (joints[0]) with up/down arrows
+    if (glfwGetKey(w, GLFW_KEY_DOWN) == GLFW_PRESS) {
+        for (auto* e : envs) e->joints[0].targetAngle -= delta_angle;
+    } else if (glfwGetKey(w, GLFW_KEY_UP) == GLFW_PRESS) {
+        for (auto* e : envs) e->joints[0].targetAngle += delta_angle;
+    }
+}
 
 // ------------------------ MAIN ------------------------
 int main() {
@@ -392,17 +411,19 @@ int main() {
     while(!glfwWindowShouldClose(engine.window)) {
         engine.run();
 
+        tempKeyControl(engine.window);
+
         // ------ RECIEVE DATA FROM PYTHON -------
-        //bool gotAction = dataManager.receiveData();
+        bool gotAction = dataManager.receiveData();
 
         for (Skeleton* env : envs) {
             env->step(dt);
         }
 
         // ------ SEND DATA TO PYTHON -------
-        //if (gotAction) {
-        //    dataManager.sendData();
-        //}
+        if (gotAction) {
+            dataManager.sendData();
+        }
 
         glfwSwapBuffers(engine.window);
         glfwPollEvents();
