@@ -8,8 +8,8 @@ import struct
 from time import sleep
 
 NUM_ENVS = 3
-action_dim = 2
-state_dim = 10
+action_dim = 4
+state_dim = 16
 
 MAX_ANGLE = math.pi
 
@@ -91,7 +91,7 @@ buffer = RolloutBuffer()
 
 def getReward(state):
     hip_angle  = torch.atan2(state[:, 0], state[:, 1])
-    hip_y_norm = state[:, 9] / 0.11
+    hip_y_norm = state[:, 15] / 0.11
 
     # --- Normalize angle to [0,1]
     angle_norm = (torch.cos(hip_angle) + 1) / 2
@@ -105,15 +105,18 @@ def getReward(state):
     main_reward = main_reward - 0.7
 
     # --- Penalties
-    stability_penalty = 0.02 * state[:, 2] ** 2
+    stability_penalty = 0.07 * state[:, 2] ** 2
     leg_penalty = 0.005 * (state[:, 5] ** 2 + state[:, 8] ** 2)
 
     return main_reward - stability_penalty - leg_penalty
 
 def isDone(state):
     hip_angle = torch.atan2(state[:, 0], state[:, 1])
-    done = torch.abs(hip_angle) > 0.8
-    return done
+    rel_R = torch.atan2(state[:, 3], state[:, 4])
+    rel_L = torch.atan2(state[:, 6], state[:, 7])
+    
+    # Reset if hip angle is too steep OR legs have crossed
+    return (torch.abs(hip_angle) > 0.8) | (rel_R >= rel_L)
 
 class UDP:
     def __init__(self, ip, recv_port, send_port):
@@ -150,101 +153,101 @@ T = 1024
 K_epochs = 10
 state_batch = udp.get_state()
 
-    
 
-print("Starting training loop...")
-for iteration in range(N):
-    buffer.clear()
+# for iteration in range(N):
+#     buffer.clear()
 
 
-    # --- data collection ---
-    for t in range(T):
-        with torch.no_grad():
-            dist, value = model(state_batch)
-        action = dist.sample()
-        log_prob = dist.log_prob(action).sum(-1)
+#     # --- data collection ---
+#     for t in range(T):
+#         with torch.no_grad():
+#             dist, value = model(state_batch)
+#         action = dist.sample()
+#         log_prob = dist.log_prob(action).sum(-1)
 
-        # step and store data
-        action_np = torch.clamp(action, -MAX_ANGLE, MAX_ANGLE).detach().numpy().flatten()
-        next_state, reward, done = udp.step(action_np)
-        buffer.store(state_batch, action, reward, done, log_prob, value)
+#         # step and store data
+#         action_np = torch.clamp(action, -MAX_ANGLE, MAX_ANGLE).detach().numpy().flatten()
+#         next_state, reward, done = udp.step(action_np)
+#         buffer.store(state_batch, action, reward, done, log_prob, value)
 
-        # reset envs
-        for i in range(NUM_ENVS):
-            if done[i]:
-                udp.send_reset(i)
-        state_batch = next_state
-        if done.any():
-            fresh = udp.get_state()
-            for i in range(NUM_ENVS):
-                if done[i]:
-                    state_batch[i] = fresh[i]
-
-
-    # --- advantage estimation ---
-    avg_reward = torch.stack(buffer.rewards).mean().item()
-    with torch.no_grad():
-        _, last_value = model(state_batch)
-    buffer.compute_gae(last_value)
-    print(f"[{iteration}] reward: {avg_reward:.3f} | advantages mean: {torch.stack(buffer.advantages).mean().item():.3f}")
+#         # reset envs
+#         for i in range(NUM_ENVS):
+#             if done[i]:
+#                 udp.send_reset(i)
+#         state_batch = next_state
+#         if done.any():
+#             fresh = udp.get_state()
+#             for i in range(NUM_ENVS):
+#                 if done[i]:
+#                     state_batch[i] = fresh[i]
 
 
-    # --- model update ---
-    clip_eps = 0.2
-    for epoch in range(K_epochs):
-        states        = torch.stack(buffer.states)
-        actions       = torch.stack(buffer.actions)
-        old_log_probs = torch.stack(buffer.log_probs)
-        advantages    = torch.stack(buffer.advantages)
-        returns       = torch.stack(buffer.returns)
+#     # --- advantage estimation ---
+#     avg_reward = torch.stack(buffer.rewards).mean().item()
+#     with torch.no_grad():
+#         _, last_value = model(state_batch)
+#     buffer.compute_gae(last_value)
+#     print(f"[{iteration}] reward: {avg_reward:.3f} | advantages mean: {torch.stack(buffer.advantages).mean().item():.3f}")
 
-        # ---- FLATTEN HERE ----
-        T_roll, Nenv, S = states.shape
 
-        states        = states.view(T_roll * Nenv, S)
-        actions       = actions.view(T_roll * Nenv, action_dim)
-        old_log_probs = old_log_probs.view(T_roll * Nenv)
-        advantages    = advantages.view(T_roll * Nenv)
-        returns       = returns.view(T_roll * Nenv)
+#     # --- model update ---
+#     clip_eps = 0.2
+#     for epoch in range(K_epochs):
+#         states        = torch.stack(buffer.states)
+#         actions       = torch.stack(buffer.actions)
+#         old_log_probs = torch.stack(buffer.log_probs)
+#         advantages    = torch.stack(buffer.advantages)
+#         returns       = torch.stack(buffer.returns)
 
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+#         # ---- FLATTEN HERE ----
+#         T_roll, Nenv, S = states.shape
 
-        dist, values  = model(states)
-        new_log_probs = dist.log_prob(actions).sum(-1)
-        entropy       = dist.entropy().sum(-1)
+#         states        = states.view(T_roll * Nenv, S)
+#         actions       = actions.view(T_roll * Nenv, action_dim)
+#         old_log_probs = old_log_probs.view(T_roll * Nenv)
+#         advantages    = advantages.view(T_roll * Nenv)
+#         returns       = returns.view(T_roll * Nenv)
 
-        ratio          = torch.exp(new_log_probs - old_log_probs)
-        clipped_ratio  = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps)
-        actor_loss = -torch.min(ratio * advantages, clipped_ratio * advantages).mean()
-        critic_loss    = nn.MSELoss()(values.squeeze(-1), returns)
-        entropy_loss   = -entropy.mean()
+#         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-        loss = actor_loss + 0.5 * critic_loss + 0.01 * entropy_loss
-        print("loss:", loss.item())
+#         dist, values  = model(states)
+#         new_log_probs = dist.log_prob(actions).sum(-1)
+#         entropy       = dist.entropy().sum(-1)
 
-        opt.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-        opt.step()
+#         ratio          = torch.exp(new_log_probs - old_log_probs)
+#         clipped_ratio  = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps)
+#         actor_loss = -torch.min(ratio * advantages, clipped_ratio * advantages).mean()
+#         critic_loss    = nn.MSELoss()(values.squeeze(-1), returns)
+#         entropy_loss   = -entropy.mean()
 
-        if epoch == K_epochs - 1:
-            print(f"  loss: {loss.item():.2f} | actor: {actor_loss.item():.3f} | critic: {critic_loss.item():.3f} | std: {torch.exp(model.log_std).tolist()}")
+#         loss = actor_loss + 0.5 * critic_loss + 0.01 * entropy_loss
+#         print("loss:", loss.item())
+
+#         opt.zero_grad()
+#         loss.backward()
+#         torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+#         opt.step()
+
+#         if epoch == K_epochs - 1:
+#             print(f"  loss: {loss.item():.2f} | actor: {actor_loss.item():.3f} | critic: {critic_loss.item():.3f} | std: {torch.exp(model.log_std).tolist()}")
 
 
 
-torch.save(model.state_dict(), "TORSO_BALANCING_POLICY.pt")
+# torch.save(model.state_dict(), "BIPEDAL_TWOJOINT_STANDING_POLICY.pt")
 
 
 
 
 # test loop 
-# while True:
-#     udp.send_actions([-100.0, -100.0])
-#     flat = torch.tensor(udp.receive_state(), dtype=torch.float32)
-#     state_batch = flat.view(NUM_ENVS, state_dim)   # update state_batch!
-#     print("reward: ", getReward(state_batch))
-#     done = isDone(state_batch)
-#     for i in range(NUM_ENVS):
-#         if done[i]:
-#             print(f"env {i} done, resetting")
-#             udp.send_reset(i)
+while True:
+    udp.send_actions([-100.0, -100.0])
+    flat = torch.tensor(udp.receive_state(), dtype=torch.float32)
+    state_batch = flat.view(NUM_ENVS, state_dim)   # update state_batch!
+    print("reward: ", getReward(state_batch))
+    done = isDone(state_batch)
+    for i in range(NUM_ENVS):
+        if done[i]:
+            print(f"env {i} done, resetting")
+            udp.send_reset(i)
+
+print("Starting training loop...")

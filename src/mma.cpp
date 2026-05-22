@@ -14,7 +14,7 @@
 using namespace glm; using namespace std;
 
 // ------------------------ Engine & Constants ----------------------
-const int NUM_ENV = 1, STATE_DIM = 10, ACTION_DIM = 2;
+const int NUM_ENV = 3, STATE_DIM = 16, ACTION_DIM = 4;
 vec2 g(0.0f, -980.6f);
 struct Engine {
     GLFWwindow* window;
@@ -197,23 +197,28 @@ struct Skeleton {
     vector<Joint> joints;
     vec2 startPos;
 
-    Bone *legR, *legL, *hip;
+    Bone *legR, *legL, *calfR, *calfL, *hip;
 
     Skeleton(vec2 p) : startPos(p) { init(p); }
 
-    void init(vec2 p) {
+    void init(vec2 p, float jitter = 0.3f) {
+        auto rnd = [&](){ return ((rand() % 1000) / 1000.0f - 0.5f) * 2.0f * jitter; };
         for(auto b : bones) delete b;
         joints.clear();
         // ---- Bones ----
-        legR    = new Bone(p, 3.14f/3.0f,  25, 5, 7.0f);
-        legL    = new Bone(p, 3.14f/1.0f, 25, 5, 7.0f);
-        hip     = new Bone(p, 0.0f, 35, 18, 10.0f);
+        legR    = new Bone(p, 0.3f    + rnd(), 25, 10, 7.0f);
+        legL    = new Bone(p, 2.94f  + rnd(), 25, 10, 7.0f);
+        calfR   = new Bone(p, glm::pi<float>()/3.0f, 20, 7,  5.0f);
+        calfL   = new Bone(p, glm::pi<float>()/1.5f, 20, 7,  5.0f);
+        hip     = new Bone(p, 0.0f      , 18, 18, 10.0f);
 
-        bones = {legL,legR,hip};
+        bones = {legL,legR,calfL,calfR,hip};
 
         // Joints 
         joints.push_back(Joint(hip,legR, {-hip->halfLength*0.71f,-hip->radius*0.71f}, {legR->halfLength,0}, 0.35f));
-        joints.push_back(Joint(hip,legL, { hip->halfLength*0.71f,-hip->radius*0.71f}, {legL->halfLength,0}, 3.14f-0.35f));
+        joints.push_back(Joint(hip,legL, { hip->halfLength*0.71f,-hip->radius*0.71f}, {legL->halfLength,0}, 1.35f));
+        joints.push_back(Joint(legR,calfR, { -legR->halfLength,0}, {calfR->halfLength,0}, 0.0f));
+        joints.push_back(Joint(legL,calfL, { -legL->halfLength,0}, {calfL->halfLength,0}, 0.0f));
 
 
         // Initial constraint alignment
@@ -247,7 +252,7 @@ struct Skeleton {
         }
     }
     void reset() {
-        init(startPos);
+        init(startPos, 0.3f);
     }
     void checkBorderCollision(Bone* b) {
         float restitution = 0.2f, slop = 0.01f, percent = 0.8f, friction = 0.8f;
@@ -313,9 +318,9 @@ struct Skeleton {
     }
 };
 vector<Skeleton*> envs {
-    // new Skeleton(vec2(400,150)),
-    new Skeleton(vec2(200,150)),
-    // new Skeleton(vec2(600,150))
+    new Skeleton(vec2(200,60)),
+    new Skeleton(vec2(400,60)),
+    new Skeleton(vec2(600,60))
 };
 
 
@@ -358,6 +363,8 @@ struct Data {
             for (Skeleton* env : envs) {
                 env->joints[0].targetAngle = recvBuffer[i++];
                 env->joints[1].targetAngle = recvBuffer[i++];
+                env->joints[2].targetAngle = recvBuffer[i++];
+                env->joints[3].targetAngle = recvBuffer[i++];
             }
         }
         return false;
@@ -367,6 +374,8 @@ struct Data {
         for (Skeleton* env : envs) {
             float relR = env->legR->angle - env->hip->angle;
             float relL = env->legL->angle - env->hip->angle;
+            float relCalfR = env->calfR->angle - env->legR->angle;
+            float relCalfL = env->calfL->angle - env->legL->angle;
 
             stateBuffer[i++] = sin(env->hip->angle);
             stateBuffer[i++] = cos(env->hip->angle);
@@ -377,6 +386,12 @@ struct Data {
             stateBuffer[i++] = sin(relL);
             stateBuffer[i++] = cos(relL);
             stateBuffer[i++] = env->legL->angVel;
+            stateBuffer[i++] = sin(relCalfR);
+            stateBuffer[i++] = cos(relCalfR);
+            stateBuffer[i++] = env->calfR->angVel;
+            stateBuffer[i++] = sin(relCalfL);
+            stateBuffer[i++] = cos(relCalfL);
+            stateBuffer[i++] = env->calfL->angVel;
             stateBuffer[i++] = env->hip->pos.y / 600.0f;
         }
 
