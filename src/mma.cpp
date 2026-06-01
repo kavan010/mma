@@ -10,11 +10,12 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <ctime>
 #include <unistd.h>
 using namespace glm; using namespace std;
 
 // ------------------------ Engine & Constants ----------------------
-const int NUM_ENV = 3, STATE_DIM = 16, ACTION_DIM = 4;
+const int NUM_ENV = 5, STATE_DIM = 34, ACTION_DIM = 10;
 vec2 g(0.0f, -980.6f);
 struct Engine {
     GLFWwindow* window;
@@ -197,29 +198,44 @@ struct Skeleton {
     vector<Joint> joints;
     vec2 startPos;
 
-    Bone *legR, *legL, *calfR, *calfL, *hip;
+    Bone *head, *body, *armL, *armR, *forearmL, *forearmR, *hip, *legR, *legL, *calfR, *calfL;
 
     Skeleton(vec2 p) : startPos(p) { init(p); }
 
     void init(vec2 p, float jitter = 0.3f) {
         auto rnd = [&](){ return ((rand() % 1000) / 1000.0f - 0.5f) * 2.0f * jitter; };
+        vec2 offset = p - vec2(400.0f, 60.0f);
         for(auto b : bones) delete b;
         joints.clear();
-        // ---- Bones ----
-        legR    = new Bone(p, 0.3f    + rnd(), 25, 10, 7.0f);
-        legL    = new Bone(p, 2.94f  + rnd(), 25, 10, 7.0f);
-        calfR   = new Bone(p, glm::pi<float>()/3.0f, 20, 7,  5.0f);
-        calfL   = new Bone(p, glm::pi<float>()/1.5f, 20, 7,  5.0f);
-        hip     = new Bone(p, 0.0f      , 18, 18, 10.0f);
 
-        bones = {legL,legR,calfL,calfR,hip};
+        // ---- Bones with jittered initial angles ----
+        head     = new Bone(vec2(400,200) + offset, 0.0f + rnd(),  12, 11,  5.5); 
+        body     = new Bone(vec2(400,130) + offset, 1.50f + rnd(),  28, 15, 24.0); 
+        hip      = new Bone(vec2(400,200) + offset, 6.36f + rnd(),  13, 13,  7.5); 
 
-        // Joints 
-        joints.push_back(Joint(hip,legR, {-hip->halfLength*0.71f,-hip->radius*0.71f}, {legR->halfLength,0}, 0.35f));
-        joints.push_back(Joint(hip,legL, { hip->halfLength*0.71f,-hip->radius*0.71f}, {legL->halfLength,0}, 1.35f));
-        joints.push_back(Joint(legR,calfR, { -legR->halfLength,0}, {calfR->halfLength,0}, 0.0f));
-        joints.push_back(Joint(legL,calfL, { -legL->halfLength,0}, {calfL->halfLength,0}, 0.0f));
+        armR     = new Bone(vec2(250,200) + offset, 4.45f + rnd(),  20,  7,  2.0); 
+        armL     = new Bone(vec2(550,200) + offset, 5.48f + rnd(),  20,  7,  2.0);
+        forearmR = new Bone(vec2(250,200) + offset, 4.45f + rnd(),  18,  6,  1.5);
+        forearmL = new Bone(vec2(550,200) + offset, 5.48f + rnd(),  18,  6,  1.5);
 
+        legR     = new Bone(vec2(250,200) + offset, 7.33f + rnd(),  28,  8,  9.5); 
+        legL     = new Bone(vec2(550,200) + offset, 8.36f + rnd(),  28,  8,  9.5);
+        calfR    = new Bone(vec2(250,200) + offset, 7.33f + rnd(),  24,  7,  3.5); 
+        calfL    = new Bone(vec2(550,200) + offset, 8.36f + rnd(),  24,  7,  3.5);
+
+        bones = {head,body,armL,armR,forearmL,forearmR,legL,legR,calfL,calfR,hip};
+
+        // Joints with jittered target angles
+        joints.push_back(Joint(body,head,{body->halfLength,0},{-head->halfLength,0}, 0.0f + rnd()));
+        joints.push_back(Joint(body,hip,{-body->halfLength,0},{0,hip->halfLength}, 4.95f + rnd()));
+        joints.push_back(Joint(body,armR,{body->halfLength*0.7f,-body->radius*0.94f},{armR->halfLength*0.95,0}, 3.0f + rnd()));
+        joints.push_back(Joint(body,armL,{body->halfLength*0.7f, body->radius*0.94f},{armL->halfLength*0.95,0}, 4.0f + rnd()));
+        joints.push_back(Joint(armR,forearmR,{-armR->halfLength,0},{forearmR->halfLength,0}, 0.0f + rnd()));
+        joints.push_back(Joint(armL,forearmL,{-armL->halfLength,0},{forearmL->halfLength,0}, 0.0f + rnd()));
+        joints.push_back(Joint(hip,legR,{-hip->radius*0.71f,-hip->radius*0.71f},{legR->halfLength,0}, 1.0f + rnd()));
+        joints.push_back(Joint(hip,legL,{ hip->radius*0.71f,-hip->radius*0.71f},{legL->halfLength,0}, 2.0f + rnd()));
+        joints.push_back(Joint(legR,calfR,{-legR->halfLength,0},{calfR->halfLength,0}, 0.0f + rnd()));
+        joints.push_back(Joint(legL,calfL,{-legL->halfLength,0},{calfL->halfLength,0}, 0.0f + rnd()));
 
         // Initial constraint alignment
         for(auto& j : joints){
@@ -237,7 +253,7 @@ struct Skeleton {
             b->draw();
         }
         // ---- Solve Joints & Apply Torque---
-        for(int i=0;i<100;i++) {
+        for(int i=0;i<50;i++) {
             for (Joint& j : joints){
                 j.solve(dt);
                 j.applyTorque(dt);
@@ -318,9 +334,11 @@ struct Skeleton {
     }
 };
 vector<Skeleton*> envs {
-    new Skeleton(vec2(200,60)),
+    new Skeleton(vec2(100,60)),
+    new Skeleton(vec2(250,60)),
     new Skeleton(vec2(400,60)),
-    new Skeleton(vec2(600,60))
+    new Skeleton(vec2(550,60)),
+    new Skeleton(vec2(700,60)),
 };
 
 
@@ -361,10 +379,9 @@ struct Data {
         } else if (bytesRead == (int)sizeof(recvBuffer)) {
             int i = 0;
             for (Skeleton* env : envs) {
-                env->joints[0].targetAngle = recvBuffer[i++];
-                env->joints[1].targetAngle = recvBuffer[i++];
-                env->joints[2].targetAngle = recvBuffer[i++];
-                env->joints[3].targetAngle = recvBuffer[i++];
+                for (int j = 0; j < ACTION_DIM && j < env->joints.size(); j++) {
+                    env->joints[j].targetAngle = recvBuffer[i++];
+                }
             }
         }
         return false;
@@ -372,26 +389,11 @@ struct Data {
     void sendData() {
         int i = 0;
         for (Skeleton* env : envs) {
-            float relR = env->legR->angle - env->hip->angle;
-            float relL = env->legL->angle - env->hip->angle;
-            float relCalfR = env->calfR->angle - env->legR->angle;
-            float relCalfL = env->calfL->angle - env->legL->angle;
-
-            stateBuffer[i++] = sin(env->hip->angle);
-            stateBuffer[i++] = cos(env->hip->angle);
-            stateBuffer[i++] = env->hip->angVel;
-            stateBuffer[i++] = sin(relR);
-            stateBuffer[i++] = cos(relR);
-            stateBuffer[i++] = env->legR->angVel;
-            stateBuffer[i++] = sin(relL);
-            stateBuffer[i++] = cos(relL);
-            stateBuffer[i++] = env->legL->angVel;
-            stateBuffer[i++] = sin(relCalfR);
-            stateBuffer[i++] = cos(relCalfR);
-            stateBuffer[i++] = env->calfR->angVel;
-            stateBuffer[i++] = sin(relCalfL);
-            stateBuffer[i++] = cos(relCalfL);
-            stateBuffer[i++] = env->calfL->angVel;
+            for (Bone* b : env->bones) {
+                stateBuffer[i++] = sin(b->angle);
+                stateBuffer[i++] = cos(b->angle);
+                stateBuffer[i++] = b->angVel;
+            }
             stateBuffer[i++] = env->hip->pos.y / 600.0f;
         }
 
@@ -401,25 +403,37 @@ struct Data {
 Data dataManager;
 
 void tempKeyControl(GLFWwindow* w) {
-    float delta_angle = 0.05f;
+    static int jointIdx = 0;
+    static bool upPressed = false, downPressed = false;
+    float delta = 0.02f;
+    int n = envs[0]->joints.size();
 
-    // Control left leg (joints[1]) with left/right arrows
-    if (glfwGetKey(w, GLFW_KEY_LEFT) == GLFW_PRESS) {
-        for (auto* e : envs) e->joints[1].targetAngle -= delta_angle;
-    } else if (glfwGetKey(w, GLFW_KEY_RIGHT) == GLFW_PRESS) {
-        for (auto* e : envs) e->joints[1].targetAngle += delta_angle;
+    // Cycle through joint indices (single press detection)
+    bool up = glfwGetKey(w, GLFW_KEY_UP) == GLFW_PRESS;
+    if (up && !upPressed) {
+        jointIdx = (jointIdx + 1) % n;
+        cout << "Selected Joint Index: " << jointIdx << endl;
     }
-    // Control right leg (joints[0]) with up/down arrows
-    if (glfwGetKey(w, GLFW_KEY_DOWN) == GLFW_PRESS) {
-        for (auto* e : envs) e->joints[0].targetAngle -= delta_angle;
-    } else if (glfwGetKey(w, GLFW_KEY_UP) == GLFW_PRESS) {
-        for (auto* e : envs) e->joints[0].targetAngle += delta_angle;
+    upPressed = up;
+
+    bool down = glfwGetKey(w, GLFW_KEY_DOWN) == GLFW_PRESS;
+    if (down && !downPressed) {
+        jointIdx = (jointIdx - 1 + n) % n;
+        cout << "Selected Joint Index: " << jointIdx << endl;
     }
+    downPressed = down;
+
+    // Adjust target angle for selected joint (continuous hold)
+    if (glfwGetKey(w, GLFW_KEY_LEFT) == GLFW_PRESS)
+        for (auto* e : envs) e->joints[jointIdx].targetAngle -= delta;
+    if (glfwGetKey(w, GLFW_KEY_RIGHT) == GLFW_PRESS)
+        for (auto* e : envs) e->joints[jointIdx].targetAngle += delta;
 }
 
 // ------------------------ MAIN ------------------------
 int main() {
-    
+    srand(time(0));
+
     float dt = 1.0/60.0;
     double lastPrintTime = 0.0;
     glfwSwapBuffers(engine.window);

@@ -10,12 +10,13 @@
                 "-g",
                 "-o",
                 "mma",
+                "-fopenmp",   // add this
                 "-lglfw",
                 "-lGLEW",
                 "-lGL",
                 "-ldl",
                 "-lpthread"
-            ],
+],
             "options": {
                 "cwd": "${workspaceFolder}"
             },
