@@ -92,76 +92,25 @@ class RolloutBuffer:
 buffer = RolloutBuffer()
 
 
-# def getReward(state):
-#     hip_angle  = torch.atan2(state[:, 0], state[:, 1])
-#     rel_calfR  = torch.atan2(state[:, 9],  state[:, 10])
-#     rel_calfL  = torch.atan2(state[:, 12], state[:, 13])
-
-#     upright    = torch.exp(-3.0 * hip_angle ** 2)
-
-#     hip_y      = state[:, 15]
-#     height     = torch.clamp((hip_y - 0.08) / (0.30 - 0.08), 0.0, 1.0)
-
-#     main_reward = upright * height
-
-#     stability_penalty = 0.05  * state[:, 2] ** 2
-#     leg_penalty       = 0.003 * (state[:, 5] ** 2 + state[:, 8] ** 2)
-#     calf_penalty      = 0.05  * (rel_calfR.clamp(max=0) ** 2 + rel_calfL.clamp(max=0) ** 2)
-#     calf_vel_penalty = 0.003 * (state[:, 11] ** 2 + state[:, 14] ** 2)
-
-#     return main_reward - stability_penalty - leg_penalty - calf_penalty - calf_vel_penalty
 def getReward(state):
-    # ---- 1. Body upright ----
     body_angle = torch.atan2(state[:, 3], state[:, 4])
-    upright = torch.exp(-3.0 * (body_angle - math.pi / 2) ** 2)
+    upright = torch.exp(-4.0 * (body_angle - math.pi / 2) ** 2)
+    hip_y = state[:, 33]
+    height = torch.clamp((hip_y - 0.08) / (0.25 - 0.08), 0.0, 1.0)
 
-    # ---- 2. Standing tall (hip_y is best available head-height proxy) ----
-    hip_y  = state[:, 33]
-    height = torch.clamp((hip_y - 0.10) / (0.28 - 0.10), 0.0, 1.0)
+    # penalize legs being asymmetric
+    legL_angle = torch.atan2(state[:, 18], state[:, 19])
+    legR_angle = torch.atan2(state[:, 21], state[:, 22])
+    leg_symmetry = torch.exp(-3.0 * (legL_angle - legR_angle) ** 2)
 
-    # ---- Core: BOTH upright AND tall — one axis can't carry the other ----
-    main_reward = upright * height
-
-    # ---- 3. Arms hanging down ----
-    arm_down_R     = torch.exp(-2.0 * (state[:,  9] - 1.0) ** 2)
-    arm_down_L     = torch.exp(-2.0 * (state[:,  6] - 1.0) ** 2)
-    forearm_down_R = torch.exp(-2.0 * (state[:, 15] - 1.0) ** 2)
-    forearm_down_L = torch.exp(-2.0 * (state[:, 12] - 1.0) ** 2)
-
-    arm_reward = 0.15 * (arm_down_R + arm_down_L + forearm_down_R + forearm_down_L) / 4.0
-
-    # ---- 4. Stability penalties (stop it spinning in place) ----
-    body_spin  = 0.02  * state[:,  5] ** 2   # body angVel
-    hip_wobble = 0.01  * state[:, 32] ** 2   # hip angVel
-    arm_flail  = 0.005 * (state[:,  8] ** 2 + state[:, 11] ** 2)  # armL/R angVel
-
-    return main_reward + arm_reward - body_spin - hip_wobble - arm_flail
-
+    return 2.0 * upright * height * leg_symmetry + 0.3
 
 def isDone(state):
-    body_angle  = torch.atan2(state[:, 3], state[:, 4])
-    body_fallen = torch.abs(body_angle - math.pi / 2) > 0.8
+    hip_low = state[:, 33] < 0.08
+    body_angle = torch.atan2(state[:, 3], state[:, 4])
+    body_fallen = torch.abs(body_angle - math.pi / 2) > 0.9  # tighter than 1.2
+    return hip_low | body_fallen
 
-    hip_low = state[:, 33] < 0.12
-
-    # ---- Head flopped too far from vertical ----
-    head_angle   = torch.atan2(state[:, 0], state[:, 1])
-    head_flopped = torch.abs(head_angle - math.pi / 2) > 1.2
-
-    # ---- Legs crossed ----
-    legs_crossed = state[:, 22] < (state[:, 19] - 0.3)
-    
-    rel_sinR  = state[:, 27] * state[:, 22] - state[:, 28] * state[:, 21]
-    rel_cosR  = state[:, 28] * state[:, 22] + state[:, 27] * state[:, 21]
-    rel_calfR = torch.atan2(rel_sinR, rel_cosR)
-
-    rel_sinL  = state[:, 24] * state[:, 19] - state[:, 25] * state[:, 18]
-    rel_cosL  = state[:, 25] * state[:, 19] + state[:, 24] * state[:, 18]
-    rel_calfL = torch.atan2(rel_sinL, rel_cosL)
-
-    knee_blown = (torch.abs(rel_calfR) > 1.4) | (torch.abs(rel_calfL) > 1.4)  # ~80°
-
-    return body_fallen | hip_low | legs_crossed | knee_blown
 
 class UDP:
     def __init__(self, ip, recv_port, send_port):
@@ -193,10 +142,26 @@ udp = UDP("127.0.0.1", 5006, 5005)
 
 
 
-N = 7500
+N = 10000
 T = 512
-K_epochs = 10
+K_epochs = 5
 state_batch = udp.get_state()
+
+
+# # test loop 
+# while True:
+#     udp.send_actions([-100.0, -100.0])
+#     flat = torch.tensor(udp.receive_state(), dtype=torch.float32)
+#     state_batch = flat.view(NUM_ENVS, state_dim)
+#     print("reward: ", getReward(state_batch))
+#     done = isDone(state_batch)
+#     for i in range(NUM_ENVS):
+#         if done[i]:
+#             print(f"env {i} done, resetting")
+#             udp.send_reset(i)
+
+
+print("Starting training loop...")
 
 if os.path.exists("WHOLE_BODY_POLICY.pt"):
     model.load_state_dict(torch.load("WHOLE_BODY_POLICY.pt"))
@@ -216,6 +181,7 @@ for iteration in range(N):
         # step and store data
         action_np = torch.clamp(action, -MAX_ANGLE, MAX_ANGLE).detach().numpy().flatten()
         next_state, reward, done = udp.step(action_np)
+        reward = reward - 0.01 * (action ** 2).sum(-1)
         buffer.store(state_batch, action, reward, done, log_prob, value)
 
         # reset envs
@@ -279,7 +245,7 @@ for iteration in range(N):
         if epoch == K_epochs - 1:
             print(f"  loss: {loss.item():.2f} | actor: {actor_loss.item():.3f} | critic: {critic_loss.item():.3f} | std: {torch.exp(model.log_std).tolist()}")
 
-    if (iteration % 100 == 0 and iteration > 0):
+    if (iteration % 25 == 0 and iteration > 0):
         torch.save(model.state_dict(), "WHOLE_BODY_POLICY.pt")
         print(f"Saved model checkpoint at iteration {iteration}")
 
@@ -300,4 +266,3 @@ torch.save(model.state_dict(), "WHOLE_BODY_POLICY.pt")
 #             print(f"env {i} done, resetting")
 #             udp.send_reset(i)
 
-# print("Starting training loop...")

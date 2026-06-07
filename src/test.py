@@ -108,10 +108,10 @@ while True:
     state = udp.step(action.flatten())
 
     # Reset environments that have fallen
-    done = isDone(state)
-    if done.any():
-        for i in range(NUM_ENVS):
-            if done[i]:
-                udp.send_reset(i)
-        fresh = udp.get_state()
-        state[done] = fresh[done]
+    # done = isDone(state)
+    # if done.any():
+    #     for i in range(NUM_ENVS):
+    #         if done[i]:
+    #             udp.send_reset(i)
+    #     fresh = udp.get_state()
+    #     state[done] = fresh[done]
