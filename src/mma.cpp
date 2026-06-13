@@ -197,13 +197,16 @@ struct Skeleton {
     vector<Bone*> bones;
     vector<Joint> joints;
     vec2 startPos;
+    int idx;
 
     Bone *head, *body, *armL, *armR, *forearmL, *forearmR, *hip, *legR, *legL, *calfR, *calfL;
 
-    Skeleton(vec2 p) : startPos(p) { init(p); }
+    Skeleton(vec2 p, int idx) : startPos(p), idx(idx) { init(p); }
 
-    void init(vec2 p, float jitter = 0.3f) {
+    void init(vec2 p, float jitter = 0.4f) {
+        //srand(time(0) + idx * 1000);
         auto rnd = [&](){ return ((rand() % 1000) / 1000.0f - 0.5f) * 2.0f * jitter; };
+
         vec2 offset = p - vec2(400.0f, 60.0f);
         for(auto b : bones) delete b;
         joints.clear();
@@ -261,7 +264,7 @@ struct Skeleton {
         }
         // ---- Euler Integrate ----
         for (Bone* b : bones) {
-            b->pos += b->vel * dt;\
+            b->pos += b->vel * dt;
             b->angVel = glm::clamp(b->angVel, -50.0f, 50.0f);
             b->angle += b->angVel * dt;
             checkBorderCollision(b);
@@ -334,11 +337,11 @@ struct Skeleton {
     }
 };
 vector<Skeleton*> envs {
-    new Skeleton(vec2(100,60)),
-    new Skeleton(vec2(250,60)),
-    new Skeleton(vec2(400,60)),
-    new Skeleton(vec2(550,60)),
-    new Skeleton(vec2(700,60)),
+    new Skeleton(vec2(100,60), 0),
+    new Skeleton(vec2(250,60), 1),
+    new Skeleton(vec2(400,60), 2),
+    new Skeleton(vec2(550,60), 3),
+    new Skeleton(vec2(700,60), 4),
 };
 
 
@@ -405,7 +408,7 @@ Data dataManager;
 void tempKeyControl(GLFWwindow* w) {
     static int jointIdx = 0;
     static bool upPressed = false, downPressed = false;
-    float delta = 0.02f;
+    float delta = 0.0025f;
     int n = envs[0]->joints.size();
 
     // Cycle through joint indices (single press detection)
@@ -432,7 +435,8 @@ void tempKeyControl(GLFWwindow* w) {
 
 // ------------------------ MAIN ------------------------
 int main() {
-    srand(time(0));
+    //srand(time(0));
+    srand(time(0) * 1234567891ULL ^ (uint64_t)clock());
 
     float dt = 1.0/60.0;
     double lastPrintTime = 0.0;
@@ -440,7 +444,7 @@ int main() {
     while(!glfwWindowShouldClose(engine.window)) {
         engine.run();
 
-        //tempKeyControl(engine.window);
+        tempKeyControl(engine.window);
 
         // ------ RECIEVE DATA FROM PYTHON -------
         bool gotAction = dataManager.receiveData();
@@ -454,7 +458,7 @@ int main() {
             dataManager.sendData();
         }
 
-        glfwSwapBuffers(engine.window);
+        // glfwSwapBuffers(engine.window);
         glfwPollEvents();
     }
 

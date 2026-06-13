@@ -8,15 +8,22 @@ import struct
 from time import sleep
 import os
 
+# env params
 NUM_ENVS = 5
 action_dim = 10
 state_dim = 34
+
+# model params
+N = 10000
+T = 2048
+K_epochs = 8
+ENT_START, ENT_END = 0.01, 0.001
 
 MAX_ANGLE = math.pi
 
 
 class ActorCritic(nn.Module):
-    def __init__(self, hidden=256):
+    def __init__(self, hidden=512):
         super().__init__()
 
         self.shared = nn.Sequential(
@@ -48,7 +55,8 @@ class ActorCritic(nn.Module):
 
         return dist, value
 model = ActorCritic()
-opt = optim.Adam(model.parameters(), lr=1e-4)
+opt = optim.Adam(model.parameters(), lr=3e-4)
+scheduler = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=N, eta_min=1e-5)
 
 
 class RolloutBuffer:
@@ -104,7 +112,6 @@ def getReward(state):
     leg_symmetry = torch.exp(-3.0 * (legL_angle - legR_angle) ** 2)
 
     return 2.0 * upright * height * leg_symmetry + 0.3
-
 def isDone(state):
     hip_low = state[:, 33] < 0.08
     body_angle = torch.atan2(state[:, 3], state[:, 4])
@@ -142,9 +149,6 @@ udp = UDP("127.0.0.1", 5006, 5005)
 
 
 
-N = 10000
-T = 512
-K_epochs = 5
 state_batch = udp.get_state()
 
 
@@ -181,15 +185,16 @@ for iteration in range(N):
         # step and store data
         action_np = torch.clamp(action, -MAX_ANGLE, MAX_ANGLE).detach().numpy().flatten()
         next_state, reward, done = udp.step(action_np)
-        reward = reward - 0.01 * (action ** 2).sum(-1)
+        # reward = reward - 0.05 * (action ** 2).sum(-1)
         buffer.store(state_batch, action, reward, done, log_prob, value)
 
         # reset envs
-        for i in range(NUM_ENVS):
-            if done[i]:
-                udp.send_reset(i)
         state_batch = next_state
         if done.any():
+            for i in range(NUM_ENVS):
+                if done[i]:
+                    udp.send_reset(i)
+            sleep(0.02)
             fresh = udp.get_state()
             for i in range(NUM_ENVS):
                 if done[i]:
@@ -234,7 +239,8 @@ for iteration in range(N):
         critic_loss    = nn.MSELoss()(values.squeeze(-1), returns)
         entropy_loss   = -entropy.mean()
 
-        loss = actor_loss + 0.5 * critic_loss + 0.01 * entropy_loss
+        ent_coeff = ENT_START * (ENT_END / ENT_START) ** (iteration / N)
+        loss = actor_loss + 0.5 * critic_loss + ent_coeff * entropy_loss
         print("loss:", loss.item())
 
         opt.zero_grad()
@@ -244,25 +250,12 @@ for iteration in range(N):
 
         if epoch == K_epochs - 1:
             print(f"  loss: {loss.item():.2f} | actor: {actor_loss.item():.3f} | critic: {critic_loss.item():.3f} | std: {torch.exp(model.log_std).tolist()}")
+    
 
-    if (iteration % 25 == 0 and iteration > 0):
+    # --- update lr and save ---
+    scheduler.step()
+    if (iteration % 50 == 0 and iteration > 0):
         torch.save(model.state_dict(), "WHOLE_BODY_POLICY.pt")
         print(f"Saved model checkpoint at iteration {iteration}")
 
 torch.save(model.state_dict(), "WHOLE_BODY_POLICY.pt")
-
-
-
-
-# test loop 
-# while True:
-#     udp.send_actions([-100.0, -100.0])
-#     flat = torch.tensor(udp.receive_state(), dtype=torch.float32)
-#     state_batch = flat.view(NUM_ENVS, state_dim)
-#     print("reward: ", getReward(state_batch))
-#     done = isDone(state_batch)
-#     for i in range(NUM_ENVS):
-#         if done[i]:
-#             print(f"env {i} done, resetting")
-#             udp.send_reset(i)
-
