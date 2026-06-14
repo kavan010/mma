@@ -15,7 +15,7 @@
 using namespace glm; using namespace std;
 
 // ------------------------ Engine & Constants ----------------------
-const int NUM_ENV = 5, STATE_DIM = 34, ACTION_DIM = 10;
+const int NUM_ENV = 2, STATE_DIM = 34, ACTION_DIM = 10;
 vec2 g(0.0f, -980.6f);
 struct Engine {
     GLFWwindow* window;
@@ -338,10 +338,25 @@ struct Skeleton {
 };
 vector<Skeleton*> envs {
     new Skeleton(vec2(100,60), 0),
-    new Skeleton(vec2(250,60), 1),
-    new Skeleton(vec2(400,60), 2),
-    new Skeleton(vec2(550,60), 3),
-    new Skeleton(vec2(700,60), 4),
+    // new Skeleton(vec2(100,60), 1),
+    // new Skeleton(vec2(100,60), 2),
+    // new Skeleton(vec2(100,60), 3),
+    // new Skeleton(vec2(250,60), 4),
+    // new Skeleton(vec2(250,60), 5),
+    // new Skeleton(vec2(250,60), 6),
+    // new Skeleton(vec2(250,60), 7),
+    // new Skeleton(vec2(400,60), 8),
+    // new Skeleton(vec2(400,60), 9),
+    // new Skeleton(vec2(400,60), 10),
+    // new Skeleton(vec2(400,60), 11),
+    // new Skeleton(vec2(550,60), 12),
+    // new Skeleton(vec2(550,60), 13),
+    // new Skeleton(vec2(550,60), 14),
+    // new Skeleton(vec2(550,60), 15),
+    // new Skeleton(vec2(700,60), 16),
+    // new Skeleton(vec2(700,60), 17),
+    // new Skeleton(vec2(700,60), 18),
+    new Skeleton(vec2(700,60), 19),
 };
 
 
@@ -376,6 +391,9 @@ struct Data {
 
         if (recvBuffer[0] == -100.0f) {
             return true; // python is asking for state
+        } else if (recvBuffer[0] == -150.0f) {
+            glfwSwapBuffers(engine.window);
+            return false;
         } else if (recvBuffer[0] == -69.0f) {
             envs[(int)recvBuffer[1]]->reset();
             return false;
@@ -408,8 +426,9 @@ Data dataManager;
 void tempKeyControl(GLFWwindow* w) {
     static int jointIdx = 0;
     static bool upPressed = false, downPressed = false;
-    float delta = 0.0025f;
+    float delta = 0.2025f;
     int n = envs[0]->joints.size();
+    // cout<<"target angle:" <<envs[0]->joints[jointIdx].targetAngle<<endl;
 
     // Cycle through joint indices (single press detection)
     bool up = glfwGetKey(w, GLFW_KEY_UP) == GLFW_PRESS;
@@ -434,8 +453,8 @@ void tempKeyControl(GLFWwindow* w) {
 }
 
 // ------------------------ MAIN ------------------------
+int timer = 0;
 int main() {
-    //srand(time(0));
     srand(time(0) * 1234567891ULL ^ (uint64_t)clock());
 
     float dt = 1.0/60.0;
@@ -457,8 +476,10 @@ int main() {
         if (gotAction) {
             dataManager.sendData();
         }
-
-        // glfwSwapBuffers(engine.window);
+        // timer++;
+        // if (timer % 3000 == 0) {
+            glfwSwapBuffers(engine.window);
+        // }
         glfwPollEvents();
     }
 

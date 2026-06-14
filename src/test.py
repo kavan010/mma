@@ -5,37 +5,56 @@ import math
 import socket
 import struct
 
-NUM_ENVS = 5
+NUM_ENVS = 2
 action_dim = 10
 state_dim = 34
 MAX_ANGLE = math.pi
 
 
 class ActorCritic(nn.Module):
-    def __init__(self, hidden=256):
+    def __init__(self, hidden=512):
         super().__init__()
-        self.shared = nn.Sequential(
+
+        # actor
+        self.actor_net = nn.Sequential(
             nn.Linear(state_dim, hidden),
             nn.Tanh(),
             nn.Linear(hidden, hidden),
             nn.Tanh(),
+            nn.Linear(hidden, hidden), 
+            nn.Tanh(),
+            nn.Linear(hidden, action_dim)
+        )
+        self.log_std = nn.Parameter(torch.zeros(action_dim))
+
+        # critic 
+        self.critic_net = nn.Sequential(
+            nn.Linear(state_dim, hidden),
+            nn.Tanh(),
             nn.Linear(hidden, hidden),
             nn.Tanh(),
+            nn.Linear(hidden, hidden), 
+            nn.Tanh(),
+            nn.Linear(hidden, 1)
         )
-        self.mean = nn.Linear(hidden, action_dim)
-        self.log_std = nn.Parameter(torch.zeros(action_dim))
-        self.value = nn.Linear(hidden, 1)
 
     def forward(self, s):
-        h = self.shared(s)
-        mean = self.mean(h)
+        # Forward pass through the separate networks
+        mean = self.actor_net(s)
         std = torch.exp(self.log_std.clamp(-3, 0.5))
         dist = Normal(mean, std)
-        value = self.value(h)
+
+        value = self.critic_net(s)
+
         return dist, value
 
 model = ActorCritic()
-model.load_state_dict(torch.load("WHOLE_BODY_POLICY.pt"))
+ckpt = torch.load("WHOLE_BODY_POLICY.pt")
+if isinstance(ckpt, dict) and 'model' in ckpt:
+    model.load_state_dict(ckpt['model'])
+else:
+    model.load_state_dict(ckpt) # Fallback for legacy flat saves
+
 model.eval()
 print("Model loaded.")
 
