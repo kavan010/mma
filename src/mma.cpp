@@ -15,7 +15,7 @@
 using namespace glm; using namespace std;
 
 // ------------------------ Engine & Constants ----------------------
-const int NUM_ENV = 2, STATE_DIM = 34, ACTION_DIM = 10;
+const int NUM_ENV = 2, STATE_DIM = 39, ACTION_DIM = 10;
 vec2 g(0.0f, -980.6f);
 struct Engine {
     GLFWwindow* window;
@@ -176,6 +176,7 @@ struct Joint {
         float angle   = B->angle - A->angle;
         float angVel  = B->angVel - A->angVel;
         float error   = targetAngle - angle;
+        error -= 2.0f * glm::pi<float>() * floorf((error + glm::pi<float>()) / (2.0f * glm::pi<float>()));
 
         float k = stiffness * maxTorque;
         float d = 2.0f * sqrt(k * (A->inertia + B->inertia));  // critical damping
@@ -266,6 +267,7 @@ struct Skeleton {
         for (Bone* b : bones) {
             b->pos += b->vel * dt;
             b->angVel = glm::clamp(b->angVel, -50.0f, 50.0f);
+            b->vel    = glm::clamp(b->vel, vec2(-3000.0f), vec2(3000.0f));
             b->angle += b->angVel * dt;
             checkBorderCollision(b);
         }
@@ -285,24 +287,29 @@ struct Skeleton {
             float penetration = 0.0f;
             bool collided = false;
 
-            if (contact.x < b->radius) {
-                normal = vec2(1,0);
-                penetration = b->radius - contact.x;
-                collided = true;
-            }
-            else if (contact.x > engine.WIDTH - b->radius) {
-                normal = vec2(-1,0);
-                penetration = contact.x - (engine.WIDTH - b->radius);
-                collided = true;
-            }
-            else if (contact.y < b->radius) {
+            // if (contact.x < b->radius) {
+            //     normal = vec2(1,0);
+            //     penetration = b->radius - contact.x;
+            //     collided = true;
+            // }
+            // else if (contact.x > engine.WIDTH - b->radius) {
+            //     normal = vec2(-1,0);
+            //     penetration = contact.x - (engine.WIDTH - b->radius);
+            //     collided = true;
+            // }
+            // else if (contact.y < b->radius) {
+            //     normal = vec2(0,1);
+            //     penetration = b->radius - contact.y;
+            //     collided = true;
+            // }
+            // else if (contact.y > engine.HEIGHT - b->radius) {
+            //     normal = vec2(0,-1);
+            //     penetration = contact.y - (engine.HEIGHT - b->radius);
+            //     collided = true;
+            // }
+            if (contact.y < b->radius) {
                 normal = vec2(0,1);
                 penetration = b->radius - contact.y;
-                collided = true;
-            }
-            else if (contact.y > engine.HEIGHT - b->radius) {
-                normal = vec2(0,-1);
-                penetration = contact.y - (engine.HEIGHT - b->radius);
                 collided = true;
             }
             if (!collided) continue;
@@ -416,6 +423,11 @@ struct Data {
                 stateBuffer[i++] = b->angVel;
             }
             stateBuffer[i++] = env->hip->pos.y / 600.0f;
+            stateBuffer[i++] = env->hip->pos.x / 800.0f;
+            stateBuffer[i++] = env->hip->vel.y / 600.0f;
+            stateBuffer[i++] = env->hip->vel.x / 800.0f;
+            stateBuffer[i++] = (env->calfL->pos.y - fabsf(sin(env->calfL->angle)) * env->calfL->halfLength <= env->calfL->radius + 1.0f) ? 1.0f : 0.0f;
+            stateBuffer[i++] = (env->calfR->pos.y - fabsf(sin(env->calfR->angle)) * env->calfR->halfLength <= env->calfR->radius + 1.0f) ? 1.0f : 0.0f;
         }
 
         sendto(sendSock, (char*)stateBuffer, i * sizeof(float), 0, (sockaddr*)&python, sizeof(python));
@@ -426,7 +438,7 @@ Data dataManager;
 void tempKeyControl(GLFWwindow* w) {
     static int jointIdx = 0;
     static bool upPressed = false, downPressed = false;
-    float delta = 0.2025f;
+    float delta = 0.005f;
     int n = envs[0]->joints.size();
     // cout<<"target angle:" <<envs[0]->joints[jointIdx].targetAngle<<endl;
 
@@ -477,7 +489,7 @@ int main() {
             dataManager.sendData();
         }
         // timer++;
-        // if (timer % 3000 == 0) {
+        // if (timer % 2500 == 0) {
             glfwSwapBuffers(engine.window);
         // }
         glfwPollEvents();

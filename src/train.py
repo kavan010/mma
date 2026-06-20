@@ -11,12 +11,14 @@ import os
 # params
 NUM_ENVS = 20
 action_dim = 10
-state_dim = 34
+state_dim = 39
 N = 10000
 T = 1024
-K_epochs = 8
-ENT_START, ENT_END = 0.01, 0.001
+K_epochs = 10
+ENT_COEF = 0.01
 MAX_ANGLE = math.pi
+STAND_ANGLE = math.pi / 2
+STAND_HEIGHT = 0.23
 
 
 # ------------------------- model core ----------------------
@@ -34,7 +36,7 @@ class ActorCritic(nn.Module):
             nn.Tanh(),
             nn.Linear(hidden, action_dim)
         )
-        self.log_std = nn.Parameter(torch.zeros(action_dim))
+        self.log_std = nn.Parameter(torch.full((action_dim,), -0.5))
 
         # critic 
         self.critic_net = nn.Sequential(
@@ -48,12 +50,14 @@ class ActorCritic(nn.Module):
         )
 
     def forward(self, s):
-        # Forward pass through the separate networks
-        mean = self.actor_net(s)
-        std = torch.exp(self.log_std.clamp(-3, 0.5))
+        s_in = s.clone()
+        s_in[:, 2:33:3] = s_in[:, 2:33:3] / 20.0
+
+        mean = self.actor_net(s_in)
+        std = torch.exp(self.log_std.clamp(-3, 0.0))
         dist = Normal(mean, std)
 
-        value = self.critic_net(s)
+        value = self.critic_net(s_in)
 
         return dist, value
 model = ActorCritic()
@@ -70,7 +74,6 @@ class RolloutBuffer:
         self.values = []
         self.advantages = []
         self.returns = []
-
     def store(self, state, action, reward, done, log_prob, value):
         self.states.append(state)
         self.actions.append(action)
@@ -78,26 +81,29 @@ class RolloutBuffer:
         self.dones.append(done.float())
         self.log_probs.append(log_prob)
         self.values.append(value.squeeze(-1))
+    
     def compute_gae(self, gamma=0.99, lam=0.95):
         avg_reward = torch.stack(self.rewards).mean().item()
+        rewards = self.rewards
+        dones = self.dones
+        values = self.values
+
         with torch.no_grad():
             _, last_value = model(state_batch)
 
         last_v = last_value.squeeze(-1)
-        values = self.values + [last_v]
+        values = values + [last_v]
 
         gae = torch.zeros(NUM_ENVS)
         adv = []
 
-        for t in reversed(range(len(self.rewards))):
-            mask = 1.0 - self.dones[t]  # 0.0 if the episode ended here
-            
-            # True temporal separation masking
-            delta = self.rewards[t] + gamma * values[t+1] * mask - values[t]
+        for t in reversed(range(len(rewards))):
+            mask = 1.0 - dones[t]
+
+            delta = rewards[t] + gamma * values[t + 1] * mask - values[t]
             gae = delta + gamma * lam * mask * gae
-            
-            # FIX: .clone() preserves the temporal state of each environment at index t
-            adv.insert(0, gae.clone()) 
+
+            adv.insert(0, gae.clone())
 
         self.advantages = adv
         self.returns = [a + v for a, v in zip(adv, self.values)]
@@ -105,22 +111,21 @@ class RolloutBuffer:
 
     # reward n' done functions
     def getReward(self, state):
-        body_angle = torch.atan2(state[:, 3], state[:, 4])
-        upright = torch.exp(-4.0 * (body_angle - math.pi / 2) ** 2)
+        b_ang = torch.atan2(state[:, 3], state[:, 4])
+        upright = torch.exp(-2.0 * (b_ang - STAND_ANGLE) ** 2)
+
         hip_y = state[:, 33]
-        height = torch.clamp((hip_y - 0.08) / (0.25 - 0.08), 0.0, 1.0)
+        height = torch.exp(-100.0 * (hip_y - STAND_HEIGHT) ** 2)
 
-        # penalize legs being asymmetric
-        legL_angle = torch.atan2(state[:, 18], state[:, 19])
-        legR_angle = torch.atan2(state[:, 21], state[:, 22])
-        leg_symmetry = torch.exp(-3.0 * (legL_angle - legR_angle) ** 2)
-
-        return 2.0 * upright * height * leg_symmetry + 0.3
+        return 0.2 + upright + height
     def isDone(self, state):
-        hip_low = state[:, 33] < 0.08
-        body_angle = torch.atan2(state[:, 3], state[:, 4])
-        body_fallen = torch.abs(body_angle - math.pi / 2) > 0.9  # tighter than 1.2
-        return hip_low | body_fallen
+        hip_y = state[:, 33]
+        hip_low = hip_y < STAND_HEIGHT / 2
+
+        b_ang = torch.atan2(state[:, 3], state[:, 4])
+        fallen = torch.abs(b_ang - STAND_ANGLE) > 0.9
+
+        return hip_low | fallen
 
     def clear(self):
         self.__init__()
@@ -155,55 +160,47 @@ class UDP:
 udp = UDP("127.0.0.1", 5006, 5005)
 
 def updateModel():
-    clip_eps  = 0.2
-    batch_size = 2048
-    ent_coeff  = ENT_START * (ENT_END / ENT_START) ** (iteration / N)
-
     states        = torch.stack(buffer.states).view(-1, state_dim)
     actions       = torch.stack(buffer.actions).view(-1, action_dim)
     old_log_probs = torch.stack(buffer.log_probs).view(-1)
     returns       = torch.stack(buffer.returns).view(-1)
     advantages    = torch.stack(buffer.advantages).view(-1)
-    
-    # Extract old values to use for robust value clipping
-    old_values    = torch.stack(buffer.values).view(-1)
-    
-    # Normalize advantages safely
-    advantages    = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-    N_samples     = states.shape[0]
 
-    for epoch in range(K_epochs):
+    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+    N_samples = states.shape[0]
+    batch_size = N_samples // 4
+
+    for _ in range(K_epochs):
         perm = torch.randperm(N_samples)
+
         for start in range(0, N_samples, batch_size):
             idx = perm[start:start + batch_size]
 
-            dist, values  = model(states[idx])
+            dist, values = model(states[idx])
             new_log_probs = dist.log_prob(actions[idx]).sum(-1)
-            entropy       = dist.entropy().sum(-1)
-            ratio         = torch.exp(new_log_probs - old_log_probs[idx])
-            clipped_ratio = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps)
+            entropy = dist.entropy().sum(-1)
 
-            # Actor update remains clean
-            actor_loss   = -torch.min(ratio * advantages[idx], clipped_ratio * advantages[idx]).mean()
-            
-            # ROBUST CRITIC UPDATE: Standard PPO Value Function Clipping
-            # This restricts the critic network from changing its output too wildly in a single step
-            v_pred = values.squeeze(-1)
-            v_clipped = old_values[idx] + torch.clamp(v_pred - old_values[idx], -clip_eps, clip_eps)
-            v_loss1 = (v_pred - returns[idx]).pow(2)
-            v_loss2 = (v_clipped - returns[idx]).pow(2)
-            critic_loss = 0.5 * torch.max(v_loss1, v_loss2).mean()
+            ratio = torch.exp(new_log_probs - old_log_probs[idx])
+            clipped = torch.clamp(ratio, 0.8, 1.2)
 
+            actor_loss   = -torch.min(ratio * advantages[idx], clipped * advantages[idx]).mean()
+            critic_loss  = (values.squeeze(-1) - returns[idx]).pow(2).mean()
             entropy_loss = -entropy.mean()
-            loss         = actor_loss + 0.5 * critic_loss + ent_coeff * entropy_loss
+
+            loss = actor_loss + 0.5 * critic_loss + ENT_COEF * entropy_loss
 
             opt.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
             opt.step()
-            
-    print(f"  loss: {loss.item():.2f} | actor: {actor_loss.item():.3f} | critic: {critic_loss.item():.3f} | std: {torch.exp(model.log_std).tolist()}")
 
+    print(
+        f"loss {loss.item():.2f} | "
+        f"actor {actor_loss.item():.3f} | "
+        f"critic {critic_loss.item():.3f} | "
+        f"std {torch.exp(model.log_std).mean().item():.3f}"
+    )
 
 # ---------------------- load model ----------------------
 print("Starting training loop...")
@@ -222,6 +219,7 @@ if os.path.exists("WHOLE_BODY_POLICY.pt"):
         print("Loaded legacy model, starting from iteration 0")
 
 
+
 # ---------------------- train ----------------------
 for iteration in range(start_iteration, N):
     buffer.clear()
@@ -230,13 +228,14 @@ for iteration in range(start_iteration, N):
     for t in range(T):
         with torch.no_grad():
             dist, value = model(state_batch)
-        action = dist.sample()
+        action = torch.clamp(dist.sample(), -MAX_ANGLE, MAX_ANGLE)
         log_prob = dist.log_prob(action).sum(-1)
-
+        
         # step and store data
-        action_np = torch.clamp(action, -MAX_ANGLE, MAX_ANGLE).detach().numpy().flatten()
+        action_np = action.detach().numpy().flatten()
         next_state, reward, done = udp.step(action_np)
-        # reward = reward - 0.05 * (action ** 2).sum(-1)
+        bad = ~torch.isfinite(next_state).all(dim=1)
+        done = done | bad
         buffer.store(state_batch, action, reward, done, log_prob, value)
 
         # reset envs
@@ -269,22 +268,12 @@ for iteration in range(start_iteration, N):
 
 
 # final save
-torch.save(model.state_dict(), "WHOLE_BODY_POLICY.pt")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+torch.save({
+    'iteration': N - 1,
+    'model': model.state_dict(),
+    'optimizer': opt.state_dict(),
+    'scheduler': scheduler.state_dict(),
+}, "WHOLE_BODY_39.pt")
 
 
 
@@ -299,3 +288,20 @@ torch.save(model.state_dict(), "WHOLE_BODY_POLICY.pt")
 #         if done[i]:
 #             print(f"env {i} done, resetting")
 #             udp.send_reset(i)
+
+
+# # measure standing pose
+# state_batch = udp.get_state()
+# while True:
+#     with torch.no_grad():
+#         dist, _ = model(state_batch)
+#     action = torch.clamp(dist.mean, -MAX_ANGLE, MAX_ANGLE)
+#     udp.send_actions(action.detach().numpy().flatten().tolist())
+#     udp.send_actions([-100.0, -100.0])
+#     flat = torch.tensor(udp.receive_state(), dtype=torch.float32)
+#     state_batch = flat.view(NUM_ENVS, state_dim)
+#     b_ang = torch.atan2(state_batch[:, 3], state_batch[:, 4])
+#     hip_y = state_batch[:, 33]
+#     print(f"b_ang {b_ang.mean().item():.3f} | hip_y {hip_y.mean().item():.3f} | reward {buffer.getReward(state_batch).mean().item():.3f}")
+
+

@@ -4,13 +4,18 @@ from torch.distributions import Normal
 import math
 import socket
 import struct
+from time import sleep
+import os
 
+# params
 NUM_ENVS = 2
 action_dim = 10
-state_dim = 34
+state_dim = 39
 MAX_ANGLE = math.pi
+CHECKPOINT = "WHOLE_BODY_POLICY.pt"
 
 
+# ------------------------- model core ----------------------
 class ActorCritic(nn.Module):
     def __init__(self, hidden=512):
         super().__init__()
@@ -21,69 +26,80 @@ class ActorCritic(nn.Module):
             nn.Tanh(),
             nn.Linear(hidden, hidden),
             nn.Tanh(),
-            nn.Linear(hidden, hidden), 
+            nn.Linear(hidden, hidden),
             nn.Tanh(),
             nn.Linear(hidden, action_dim)
         )
         self.log_std = nn.Parameter(torch.zeros(action_dim))
 
-        # critic 
+        # critic
         self.critic_net = nn.Sequential(
             nn.Linear(state_dim, hidden),
             nn.Tanh(),
             nn.Linear(hidden, hidden),
             nn.Tanh(),
-            nn.Linear(hidden, hidden), 
+            nn.Linear(hidden, hidden),
             nn.Tanh(),
             nn.Linear(hidden, 1)
         )
 
     def forward(self, s):
-        # Forward pass through the separate networks
-        mean = self.actor_net(s)
-        std = torch.exp(self.log_std.clamp(-3, 0.5))
+        s_in = s.clone()
+        s_in[:, 2:33:3] = s_in[:, 2:33:3] / 20.0
+        mean = self.actor_net(s_in)
+        std = torch.exp(self.log_std.clamp(-3, 0.0))
         dist = Normal(mean, std)
 
-        value = self.critic_net(s)
+        value = self.critic_net(s_in)
 
         return dist, value
-
 model = ActorCritic()
-ckpt = torch.load("WHOLE_BODY_POLICY.pt")
-if isinstance(ckpt, dict) and 'model' in ckpt:
-    model.load_state_dict(ckpt['model'])
-else:
-    model.load_state_dict(ckpt) # Fallback for legacy flat saves
-
 model.eval()
-print("Model loaded.")
 
-def isDone(state):
-    # ---- Body (torso) tilted too far from vertical ----
-    body_angle  = torch.atan2(state[:, 3], state[:, 4])
-    body_fallen = torch.abs(body_angle - math.pi / 2) > 0.8   # ~45° tolerance
 
-    # ---- Hip too low = legs gave out / collapsed ----
-    hip_low = state[:, 33] < 0.12
+class Env:
+    # reward n' done functions (kept identical to training script,
+    # only used here so udp.step() still works without changes)
+    def getReward(self, state):
+        b_ang = torch.atan2(state[:, 3], state[:, 4])
+        upright = torch.exp(-4.0 * (b_ang - math.pi / 2) ** 2)
 
-    # ---- Head flopped too far from vertical ----
-    head_angle   = torch.atan2(state[:, 0], state[:, 1])
-    head_flopped = torch.abs(head_angle - math.pi / 2) > 1.2  # ~70° tolerance
+        hip_y = state[:, 33]
+        height = torch.exp(-40.0 * (hip_y - 0.23) ** 2)
 
-    # ---- Legs crossed ----
-    legs_crossed = state[:, 22] < (state[:, 19] - 0.3)
-    
-    rel_sinR  = state[:, 27] * state[:, 22] - state[:, 28] * state[:, 21]
-    rel_cosR  = state[:, 28] * state[:, 22] + state[:, 27] * state[:, 21]
-    rel_calfR = torch.atan2(rel_sinR, rel_cosR)
+        hip_x = state[:, 34]
+        tgt_x = (torch.round(hip_x * 6) / 6)
+        drift = torch.exp(-12.0 * (hip_x - tgt_x) ** 2)
 
-    rel_sinL  = state[:, 24] * state[:, 19] - state[:, 25] * state[:, 18]
-    rel_cosL  = state[:, 25] * state[:, 19] + state[:, 24] * state[:, 18]
-    rel_calfL = torch.atan2(rel_sinL, rel_cosL)
+        l_ang = torch.atan2(state[:, 18], state[:, 19])
+        r_ang = torch.atan2(state[:, 21], state[:, 22])
+        sym = torch.exp(-4.0 * (l_ang + r_ang - math.pi) ** 2)
+        space = torch.exp(-5.0 * (torch.abs(l_ang - r_ang) - 0.35) ** 2)
 
-    knee_blown = (torch.abs(rel_calfR) > 1.4) | (torch.abs(rel_calfL) > 1.4)  # ~80°
+        foot_l = state[:, 37]
+        foot_r = state[:, 38]
+        feet_contact = foot_l * foot_r
 
-    return body_fallen | hip_low | legs_crossed | knee_blown
+        jitter = 0.006 * torch.sum(state[:, 2:33:3] ** 2, dim=-1)
+
+        return (
+            3.0 * upright * height * drift
+            + 0.2 * sym
+            + 0.2 * space
+            + 0.2 * feet_contact
+            - jitter
+            + 0.3
+        )
+
+    def isDone(self, state):
+        hip_y = state[:, 33]
+        hip_low = hip_y < 0.115
+
+        b_ang = torch.atan2(state[:, 3], state[:, 4])
+        fallen = torch.abs(b_ang - math.pi / 2) > 0.9
+
+        return hip_low | fallen
+buffer = Env()
 
 
 class UDP:
@@ -103,34 +119,54 @@ class UDP:
     def get_state(self):
         self.send_actions([-100.0, -100.0])
         flat = torch.tensor(self.receive_state(), dtype=torch.float32)
-        return flat.view(NUM_ENVS, state_dim)
+        s = flat.view(NUM_ENVS, state_dim)
+        return s
 
-    def step(self, target_angles):
-        self.send_actions(target_angles.tolist())
+    def step(self, target_angle):
+        self.send_actions(target_angle.tolist())
         self.send_actions([-100.0, -100.0])
         flat = torch.tensor(self.receive_state(), dtype=torch.float32)
-        return flat.view(NUM_ENVS, state_dim)
+        s = flat.view(NUM_ENVS, state_dim)
+        return s, buffer.getReward(s), buffer.isDone(s)
 
     def send_reset(self, env_idx):
         self.send_actions([-69.0, float(env_idx)])
-
 udp = UDP("127.0.0.1", 5006, 5005)
-state = udp.get_state()
 
-print("Running model (Ctrl+C to stop)...")
+# ---------------------- load model ----------------------
+print("Loading policy...")
+if os.path.exists(CHECKPOINT):
+    ckpt = torch.load(CHECKPOINT, map_location="cpu")
+    if isinstance(ckpt, dict) and 'model' in ckpt:
+        model.load_state_dict(ckpt['model'])
+        print(f"Loaded checkpoint from iteration {ckpt.get('iteration', '?')}")
+    else:
+        model.load_state_dict(ckpt)  # handles legacy flat checkpoint
+        print("Loaded legacy model")
+else:
+    print(f"WARNING: {CHECKPOINT} not found, running with randomly initialized weights")
+
+# ---------------------- run ----------------------
+print("Starting test loop...")
+state_batch = udp.get_state()
+
 while True:
     with torch.no_grad():
-        dist, _ = model(state)
-        action = dist.mean
-        action = torch.clamp(action, -MAX_ANGLE, MAX_ANGLE)
+        dist, value = model(state_batch)
+        action = dist.mean  # deterministic action for testing/inference
 
-    state = udp.step(action.flatten())
+    action_np = torch.clamp(action, -MAX_ANGLE, MAX_ANGLE).numpy().flatten()
+    next_state, reward, done = udp.step(action_np)
 
-    # Reset environments that have fallen
-    # done = isDone(state)
-    # if done.any():
-    #     for i in range(NUM_ENVS):
-    #         if done[i]:
-    #             udp.send_reset(i)
-    #     fresh = udp.get_state()
-    #     state[done] = fresh[done]
+    print(f"reward: {reward.mean().item():.3f}")
+
+    state_batch = next_state
+    if done.any():
+        for i in range(NUM_ENVS):
+            if done[i]:
+                udp.send_reset(i)
+        sleep(0.005)
+        fresh = udp.get_state()
+        for i in range(NUM_ENVS):
+            if done[i]:
+                state_batch[i] = fresh[i]
