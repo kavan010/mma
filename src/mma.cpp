@@ -1,500 +1,323 @@
+#define GLM_ENABLE_EXPERIMENTAL
 #include <GL/glew.h>
 #include <GLFW/glfw3.h>
 #include <glm/glm.hpp>
-#include <glm/gtc/constants.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/type_ptr.hpp>
+#include <glm/gtc/quaternion.hpp>
+#include <glm/gtx/quaternion.hpp>
+#include <vector>
 #include <iostream>
 #include <cmath>
-#include <cstdlib>
-#include <list>
-#include <vector>
-#include <sys/socket.h>
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <ctime>
-#include <unistd.h>
-using namespace glm; using namespace std;
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+using namespace glm;
+using namespace std;
 
-// ------------------------ Engine & Constants ----------------------
-const int NUM_ENV = 2, STATE_DIM = 39, ACTION_DIM = 10;
-vec2 g(0.0f, -980.6f);
+// ================= camera ================= //
+struct Camera {
+    float radius = 50.0f;
+    float azimuth = 0.0f;
+    float elevation = M_PI / 2.0f;
+    float orbitSpeed = 0.01f;
+    double zoomSpeed = 110.0;
+    bool dragging = false;
+    double lastX = 0.0, lastY = 0.0;
+
+    vec3 position() const {
+        float e = glm::clamp(elevation, 0.01f, float(M_PI) - 0.01f);
+        return vec3(radius * sin(e) * cos(azimuth), radius * cos(e), radius * sin(e) * sin(azimuth));
+    }
+    void processMouseMove(double x, double y) {
+        if (dragging) {
+            azimuth += float(x - lastX) * orbitSpeed;
+            elevation = glm::clamp(elevation - float(y - lastY) * orbitSpeed, 0.01f, float(M_PI) - 0.01f);
+        }
+        lastX = x; lastY = y;
+    }
+    void processMouseButton(int button, int action, GLFWwindow* win) {
+        if (button != GLFW_MOUSE_BUTTON_LEFT && button != GLFW_MOUSE_BUTTON_MIDDLE) return;
+        if (action == GLFW_PRESS) { dragging = true; glfwGetCursorPos(win, &lastX, &lastY); }
+        else if (action == GLFW_RELEASE) dragging = false;
+    }
+    void processScroll(double, double yoffset) {
+        radius = glm::max(1.0, radius - yoffset * zoomSpeed);
+    }
+};
+Camera camera;
+
+// ================= engine ================= //
 struct Engine {
     GLFWwindow* window;
-    int WIDTH = 800, HEIGHT = 600;
+    int width = 800, height = 600;
+    GLuint shaderProgram;
+    GLint modelLoc, viewLoc, projLoc, colorLoc;
+    GLuint sphereVAO, sphereVBO;
+    int sphereVertexCount;
 
-    Engine () {
-        if (!glfwInit()) {
-            cerr << "Failed to initialize GLFW" << endl; exit(EXIT_FAILURE);
-        }
+    const char* vertexShaderSource = R"glsl(
+        #version 330 core
+        layout(location=0) in vec3 aPos;
+        uniform mat4 model, view, projection;
+        void main() { gl_Position = projection * view * model * vec4(aPos, 1.0); }
+    )glsl";
 
-        window = glfwCreateWindow(WIDTH, HEIGHT, "RL is pain", nullptr, nullptr);
-        if (!window) {
-            cerr << "Failed to create GLFW window" << endl;
-            glfwTerminate(); exit(EXIT_FAILURE);
-        }
+    const char* fragmentShaderSource = R"glsl(
+        #version 330 core
+        out vec4 FragColor;
+        uniform vec4 objectColor;
+        void main() { FragColor = objectColor; }
+    )glsl";
 
+    Engine() {
+        glfwInitHint(GLFW_PLATFORM, GLFW_PLATFORM_X11); // GLEW needs a GLX context; native Wayland breaks glewInit()
+        if (!glfwInit()) exit(-1);
+        glfwWindowHintString(GLFW_X11_CLASS_NAME, "mma3d"); // lets Hyprland target this window with a float rule
+        glfwWindowHintString(GLFW_X11_INSTANCE_NAME, "mma3d");
+        window = glfwCreateWindow(width, height, "3D Viewer", NULL, NULL);
         glfwMakeContextCurrent(window);
-        int fbWidth, fbHeight;
-        glfwGetFramebufferSize(window, &fbWidth, &fbHeight);
-        glViewport(0, 0, fbWidth, fbHeight);
-    }
-    void run() {
-        glClear(GL_COLOR_BUFFER_BIT);
-        glMatrixMode(GL_PROJECTION);
-        glLoadIdentity();
-        glOrtho(0.0, (double)WIDTH, 0.0, (double)HEIGHT, -1.0, 1.0);
+        glewInit();
+        glEnable(GL_DEPTH_TEST);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+        shaderProgram = compileShader();
+        modelLoc = glGetUniformLocation(shaderProgram, "model");
+        viewLoc  = glGetUniformLocation(shaderProgram, "view");
+        projLoc  = glGetUniformLocation(shaderProgram, "projection");
+        colorLoc = glGetUniformLocation(shaderProgram, "objectColor");
+
+        buildSphere();
+        glfwSetWindowUserPointer(window, &camera);
+        glfwSetMouseButtonCallback(window, [](GLFWwindow* win, int button, int action, int) {
+            ((Camera*)glfwGetWindowUserPointer(win))->processMouseButton(button, action, win);
+        });
+        glfwSetCursorPosCallback(window, [](GLFWwindow* win, double x, double y) {
+            ((Camera*)glfwGetWindowUserPointer(win))->processMouseMove(x, y);
+        });
+        glfwSetScrollCallback(window, [](GLFWwindow* win, double x, double y) {
+            ((Camera*)glfwGetWindowUserPointer(win))->processScroll(x, y);
+        });
     }
 
-    // ------ Helper Functions ------
-    float cross(vec2 a, vec2 b) {
-        return a.x*b.y - a.y*b.x;
+    GLuint compileShader() {
+        GLuint vs = glCreateShader(GL_VERTEX_SHADER);
+        glShaderSource(vs, 1, &vertexShaderSource, NULL);
+        glCompileShader(vs);
+        GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
+        glShaderSource(fs, 1, &fragmentShaderSource, NULL);
+        glCompileShader(fs);
+        GLuint prog = glCreateProgram();
+        glAttachShader(prog, vs);
+        glAttachShader(prog, fs);
+        glLinkProgram(prog);
+        return prog;
     }
-    void drawCircle(vec2 pos, float radius, vec3 color) {
-        glColor3f(color.r, color.g, color.b);
-        glBegin(GL_TRIANGLE_FAN);
-            glVertex2f(pos.x, pos.y);
-            for (int i = 0; i <= 20; i++) {
-                float a = (i / 20.0f) * 2.0f * glm::pi<float>();
-                glVertex2f(pos.x + cos(a)*radius, pos.y + sin(a)*radius);
+
+    void buildSphere() {
+        vector<float> vertices;
+        float r = 1.0f;
+        int stacks = 12, sectors = 16;
+        for (int i = 0; i < stacks; ++i) {
+            float t1 = (float)i / stacks * M_PI, t2 = (float)(i + 1) / stacks * M_PI;
+            for (int j = 0; j < sectors; ++j) {
+                float p1 = (float)j / sectors * 2 * M_PI, p2 = (float)(j + 1) / sectors * 2 * M_PI;
+                auto pos = [&](float t, float p) { return vec3(r * sin(t) * cos(p), r * cos(t), r * sin(t) * sin(p)); };
+                vec3 v1 = pos(t1, p1), v2 = pos(t1, p2), v3 = pos(t2, p1), v4 = pos(t2, p2);
+                vertices.insert(vertices.end(), {v1.x, v1.y, v1.z, v2.x, v2.y, v2.z, v3.x, v3.y, v3.z});
+                vertices.insert(vertices.end(), {v2.x, v2.y, v2.z, v4.x, v4.y, v4.z, v3.x, v3.y, v3.z});
             }
-        glEnd();
+        }
+        sphereVertexCount = vertices.size() / 3;
+        createVAO(sphereVAO, sphereVBO, vertices.data(), vertices.size());
     }
 
-    // ------ Callbacks ------
-    vec2 rotate(vec2 v, float a) {
-        float c = cos(a), s = sin(a);
-        return vec2(c*v.x - s*v.y, s*v.x + c*v.y);
+    void createVAO(GLuint& VAO, GLuint& VBO, const float* data, size_t count) {
+        glGenVertexArrays(1, &VAO);
+        glGenBuffers(1, &VBO);
+        glBindVertexArray(VAO);
+        glBindBuffer(GL_ARRAY_BUFFER, VBO);
+        glBufferData(GL_ARRAY_BUFFER, count * sizeof(float), data, GL_STATIC_DRAW);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+        glEnableVertexAttribArray(0);
+        glBindVertexArray(0);
     }
-    vec2 cross(float s, vec2 v) {
-        return vec2(-s*v.y, s*v.x);
+
+    void beginFrame() {
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glUseProgram(shaderProgram);
+        mat4 proj = perspective(radians(45.0f), (float)width / height, 0.1f, 1000.0f);
+        mat4 view = lookAt(camera.position(), vec3(0.0f), vec3(0, 1, 0));
+        glUniformMatrix4fv(projLoc, 1, GL_FALSE, value_ptr(proj));
+        glUniformMatrix4fv(viewLoc, 1, GL_FALSE, value_ptr(view));
+    }
+
+    void drawSphere(vec3 pos, float radius, vec4 color) {
+        mat4 model = translate(mat4(1.0f), pos) * scale(mat4(1.0f), vec3(radius));
+        glUniformMatrix4fv(modelLoc, 1, GL_FALSE, value_ptr(model));
+        glUniform4fv(colorLoc, 1, value_ptr(color));
+        glBindVertexArray(sphereVAO);
+        glDrawArrays(GL_TRIANGLES, 0, sphereVertexCount);
     }
 };
 Engine engine;
 
+// ================= grid ================= //
+struct Grid {
+    GLuint VAO, VBO;
+    int vertexCount;
 
-// ------------------------ Bodies & Physics ------------------------
-struct Bone {
-    vec2 pos, vel;
-    float angle, angVel;
-    float halfLength, radius, mass, inertia, invMass, invInertia;
-    vec2 force = vec2(0.0f);
-    float torque = 0.0f;
-    bool dragged = false;
-
-    Bone(vec2 p,float a,float l,float r,float m) : pos(p), vel(0), angle(a), angVel(0), halfLength(l), radius(r), mass(m) {
-        float L=l*2, W=r*2;
-        inertia=(m*(L*L+W*W))/12.f;
-        invMass=1.f/m;
-        invInertia=1.f/inertia;
-    }
-    vec2 worldPoint(vec2 local) const {
-        float c=cos(angle), s=sin(angle);
-        return pos + vec2(c*local.x - s*local.y, s*local.x + c*local.y);
-    }
-    void draw() {
-        vec2 dir(cos(angle),sin(angle));
-        vec2 p1=pos-dir*halfLength, p2=pos+dir*halfLength;
-
-        if(glm::length(p2-p1)*glm::length(p2-p1)==0) return;
-
-        vec2 d=glm::normalize(p2-p1), r=vec2(-d.y,d.x)*radius;
-        vec2 c1=p1+d*radius, c2=p2-d*radius;
-
-        // Draw Rectangle Portion
-        glColor4f(1,1,1,1);
-        glBegin(GL_QUADS);
-            glVertex2f((c2+r).x,(c2+r).y);
-            glVertex2f((c2-r).x,(c2-r).y);
-            glVertex2f((c1-r).x,(c1-r).y);
-            glVertex2f((c1+r).x,(c1+r).y);
-        glEnd();
-
-        // Draw End Caps
-        for(vec2 c:{c1,c2}){
-            glBegin(GL_TRIANGLE_FAN);
-            glVertex2f(c.x,c.y);
-            for(int i=0;i<=20;i++){
-                float a=i/20.f*2*glm::pi<float>();
-                glVertex2f(c.x+cos(a)*radius,c.y+sin(a)*radius);
-            }
-            glEnd();
+    Grid(float size = 500.0f, int divisions = 50) {
+        vector<float> vertices;
+        float step = size / divisions, half = size / 2.0f;
+        for (int i = 0; i <= divisions; ++i) {
+            float x = -half + i * step, z = -half + i * step;
+            vertices.insert(vertices.end(), {x, 0, -half, x, 0, half});
+            vertices.insert(vertices.end(), {-half, 0, z, half, 0, z});
         }
+        vertexCount = vertices.size() / 3;
+        engine.createVAO(VAO, VBO, vertices.data(), vertices.size());
+    }
+
+    void draw() {
+        mat4 model = mat4(1.0f);
+        glUniformMatrix4fv(engine.modelLoc, 1, GL_FALSE, value_ptr(model));
+        glUniform4f(engine.colorLoc, 1.0f, 1.0f, 1.0f, 0.15f);
+        glBindVertexArray(VAO);
+        glDrawArrays(GL_LINES, 0, vertexCount);
+    }
+};
+Grid grid;
+
+
+struct Bone {
+    vec3 pos = vec3(0), vel = vec3(0), angVel = vec3(0);
+    quat orient = quat(1, 0, 0, 0);
+    vec3 dims;
+    float mass, invMass;
+    mat3 invInertiaBody = mat3(1.0f);
+    bool isEndEffector = false;
+    vec3 color;
+    GLuint VAO = 0, VBO = 0;
+    int vertexCount = 0;
+
+    Bone(vec3 p, vec3 d, float m, vec3 c = vec3(0.85f), bool endEffector = false)
+        : pos(p), dims(d), mass(m), color(c), isEndEffector(endEffector) { invMass = 1.0f / m; }
+
+    vec3 posRelativeTo(const Bone& root) const { return inverse(root.orient) * (pos - root.pos); }
+    quat orientRelativeTo(const Bone& root) const { return inverse(root.orient) * orient; }
+
+    void setInertia(vec3 I) {
+        invInertiaBody = mat3(0.0f);
+        invInertiaBody[0][0] = 1.0f / I.x; invInertiaBody[1][1] = 1.0f / I.y; invInertiaBody[2][2] = 1.0f / I.z;
+    }
+
+    void drawBox() {
+        if (VAO == 0) {
+            float x = 2 * dims.x, y = 2 * dims.y, z = 2 * dims.z;
+            setInertia(mass * vec3(y * y + z * z, x * x + z * z, x * x + y * y) / 12.0f);
+
+            vector<float> v;
+            vec3 he = dims, n[6] = {{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}};
+            for (vec3 a : n) {
+                vec3 u = vec3(a.y, a.z, a.x), w = cross(a, u), c = a * he;
+                vec3 p1 = c + (u + w) * he, p2 = c + (u - w) * he, p3 = c - (u + w) * he, p4 = c - (u - w) * he;
+                for (vec3 p : {p1, p2, p3, p1, p3, p4}) v.insert(v.end(), {p.x, p.y, p.z});
+            }
+            vertexCount = v.size() / 3;
+            engine.createVAO(VAO, VBO, v.data(), v.size());
+        }
+        draw();
+    }
+
+    void drawCapsule() {
+        if (VAO == 0) {
+            float r = dims.x, h = dims.y, L = 2 * h;
+            setInertia(vec3((mass / 12.0f) * (3 * r * r + L * L), 0.5f * mass * r * r, (mass / 12.0f) * (3 * r * r + L * L)));
+
+            vector<float> v;
+            int stacks = 8, sectors = 16;
+            auto push = [&](vec3 p) { v.insert(v.end(), {p.x, p.y, p.z}); };
+            for (int j = 0; j < sectors; j++) {
+                float p1 = (float)j / sectors * 2 * M_PI, p2 = (float)(j + 1) / sectors * 2 * M_PI;
+                vec3 a1(cos(p1) * r, h, sin(p1) * r), a2(cos(p2) * r, h, sin(p2) * r);
+                vec3 b1(cos(p1) * r, -h, sin(p1) * r), b2(cos(p2) * r, -h, sin(p2) * r);
+                push(a1); push(b1); push(a2); push(a2); push(b1); push(b2);
+            }
+            for (int cap = 0; cap < 2; cap++) {
+                float dir = cap == 0 ? 1.0f : -1.0f, yoff = cap == 0 ? h : -h;
+                for (int i = 0; i < stacks / 2; i++) {
+                    float t1 = (float)i / stacks * M_PI, t2 = (float)(i + 1) / stacks * M_PI;
+                    for (int j = 0; j < sectors; j++) {
+                        float p1 = (float)j / sectors * 2 * M_PI, p2 = (float)(j + 1) / sectors * 2 * M_PI;
+                        auto sp = [&](float t, float p) { return vec3(r * sin(t) * cos(p), yoff + dir * r * cos(t), r * sin(t) * sin(p)); };
+                        vec3 v1 = sp(t1, p1), v2 = sp(t1, p2), v3 = sp(t2, p1), v4 = sp(t2, p2);
+                        push(v1); push(v2); push(v3); push(v2); push(v4); push(v3);
+                    }
+                }
+            }
+            vertexCount = v.size() / 3;
+            engine.createVAO(VAO, VBO, v.data(), v.size());
+        }
+        draw();
+    }
+
+    void draw() {
+        mat4 model = translate(mat4(1.0f), pos) * mat4_cast(orient);
+        glUniformMatrix4fv(engine.modelLoc, 1, GL_FALSE, value_ptr(model));
+        glUniform4f(engine.colorLoc, color.r, color.g, color.b, 1.0f);
+        glBindVertexArray(VAO);
+        glDrawArrays(GL_TRIANGLES, 0, vertexCount);
     }
 };
 struct Joint {
-    Bone* A, *B; // bones conected by this joint
-    vec2 anchorA_local, anchorB_local; // local positions the joint connects to
-    float maxTorque = 1e5f;
 
-    // --- Controller Properties ---
-    float targetAngle = 0;
-    float stiffness = 1.0f;
-
-    Joint(Bone* a, Bone* b, vec2 anchorA, vec2 anchorB, float targetAngle=0.0f, float stiffness=1.0f) : 
-    A(a), B(b), anchorA_local(anchorA), anchorB_local(anchorB), targetAngle(targetAngle), stiffness(stiffness) { }
-
-    void solve(float dt) {
-        Bone* A = this->A; Bone* B = this->B;
-
-        vec2 rA = engine.rotate(anchorA_local, A->angle), rB = engine.rotate(anchorB_local, B->angle);
-        vec2 pA = A->pos + rA, pB = B->pos + rB;
-
-        // position error
-        vec2 C = pB - pA;
-        // anchor velocities
-        vec2 vA = A->vel + engine.cross(A->angVel, rA);
-        vec2 vB = B->vel + engine.cross(B->angVel, rB);
-
-        vec2 relVel = vB - vA;
-
-        // --- Baumgarte stabilization ---
-        float beta = 0.8f;
-        vec2 bias = (beta / dt) * C;
-        vec2 Cdot = relVel + bias;
-
-        float k11 = A->invMass + B->invMass + A->invInertia*rA.y*rA.y + B->invInertia*rB.y*rB.y;
-        float k12 = -A->invInertia*rA.x*rA.y - B->invInertia*rB.x*rB.y;
-        float k21 = k12;
-        float k22 = A->invMass + B->invMass + A->invInertia*rA.x*rA.x + B->invInertia*rB.x*rB.x;
-
-        float det = k11*k22 - k12*k21;
-        if(det == 0) return;
-
-        float invDet = 1.0f / det;
-
-        vec2 impulse;
-        impulse.x = -( k22*Cdot.x - k12*Cdot.y) * invDet;
-        impulse.y = -(-k21*Cdot.x + k11*Cdot.y) * invDet;
-
-        A->vel -= impulse * A->invMass;
-        B->vel += impulse * B->invMass;
-
-        A->angVel -= engine.cross(rA, impulse) * A->invInertia;
-        B->angVel += engine.cross(rB, impulse) * B->invInertia;
-    }
-    void applyTorque(float dt) {
-
-        float angle   = B->angle - A->angle;
-        float angVel  = B->angVel - A->angVel;
-        float error   = targetAngle - angle;
-        error -= 2.0f * glm::pi<float>() * floorf((error + glm::pi<float>()) / (2.0f * glm::pi<float>()));
-
-        float k = stiffness * maxTorque;
-        float d = 2.0f * sqrt(k * (A->inertia + B->inertia));  // critical damping
-
-        float torque  = k * error - d * angVel;
-
-        // clamp to maxTorque so it cant explode
-        torque = glm::clamp(torque, -maxTorque, maxTorque);
-
-        // convert to impulse scaled by dt
-        float impulse = torque * dt;
-
-        A->angVel -= impulse * A->invInertia;
-        B->angVel += impulse * B->invInertia;
-    }
 };
 
 struct Skeleton {
     vector<Bone*> bones;
     vector<Joint> joints;
-    vec2 startPos;
+    vec3 startPos;
     int idx;
 
-    Bone *head, *body, *armL, *armR, *forearmL, *forearmR, *hip, *legR, *legL, *calfR, *calfL;
-
-    Skeleton(vec2 p, int idx) : startPos(p), idx(idx) { init(p); }
-
-    void init(vec2 p, float jitter = 0.4f) {
-        //srand(time(0) + idx * 1000);
-        auto rnd = [&](){ return ((rand() % 1000) / 1000.0f - 0.5f) * 2.0f * jitter; };
-
-        vec2 offset = p - vec2(400.0f, 60.0f);
-        for(auto b : bones) delete b;
-        joints.clear();
-
-        // ---- Bones with jittered initial angles ----
-        head     = new Bone(vec2(400,200) + offset, 0.0f + rnd(),  12, 11,  5.5); 
-        body     = new Bone(vec2(400,130) + offset, 1.50f + rnd(),  28, 15, 24.0); 
-        hip      = new Bone(vec2(400,200) + offset, 6.36f + rnd(),  13, 13,  7.5); 
-
-        armR     = new Bone(vec2(250,200) + offset, 4.45f + rnd(),  20,  7,  2.0); 
-        armL     = new Bone(vec2(550,200) + offset, 5.48f + rnd(),  20,  7,  2.0);
-        forearmR = new Bone(vec2(250,200) + offset, 4.45f + rnd(),  18,  6,  1.5);
-        forearmL = new Bone(vec2(550,200) + offset, 5.48f + rnd(),  18,  6,  1.5);
-
-        legR     = new Bone(vec2(250,200) + offset, 7.33f + rnd(),  28,  8,  9.5); 
-        legL     = new Bone(vec2(550,200) + offset, 8.36f + rnd(),  28,  8,  9.5);
-        calfR    = new Bone(vec2(250,200) + offset, 7.33f + rnd(),  24,  7,  3.5); 
-        calfL    = new Bone(vec2(550,200) + offset, 8.36f + rnd(),  24,  7,  3.5);
-
-        bones = {head,body,armL,armR,forearmL,forearmR,legL,legR,calfL,calfR,hip};
-
-        // Joints with jittered target angles
-        joints.push_back(Joint(body,head,{body->halfLength,0},{-head->halfLength,0}, 0.0f + rnd()));
-        joints.push_back(Joint(body,hip,{-body->halfLength,0},{0,hip->halfLength}, 4.95f + rnd()));
-        joints.push_back(Joint(body,armR,{body->halfLength*0.7f,-body->radius*0.94f},{armR->halfLength*0.95,0}, 3.0f + rnd()));
-        joints.push_back(Joint(body,armL,{body->halfLength*0.7f, body->radius*0.94f},{armL->halfLength*0.95,0}, 4.0f + rnd()));
-        joints.push_back(Joint(armR,forearmR,{-armR->halfLength,0},{forearmR->halfLength,0}, 0.0f + rnd()));
-        joints.push_back(Joint(armL,forearmL,{-armL->halfLength,0},{forearmL->halfLength,0}, 0.0f + rnd()));
-        joints.push_back(Joint(hip,legR,{-hip->radius*0.71f,-hip->radius*0.71f},{legR->halfLength,0}, 1.0f + rnd()));
-        joints.push_back(Joint(hip,legL,{ hip->radius*0.71f,-hip->radius*0.71f},{legL->halfLength,0}, 2.0f + rnd()));
-        joints.push_back(Joint(legR,calfR,{-legR->halfLength,0},{calfR->halfLength,0}, 0.0f + rnd()));
-        joints.push_back(Joint(legL,calfL,{-legL->halfLength,0},{calfL->halfLength,0}, 0.0f + rnd()));
-
-        // Initial constraint alignment
-        for(auto& j : joints){
-            vec2 err = j.A->worldPoint(j.anchorA_local) - j.B->worldPoint(j.anchorB_local);
-            j.B->pos += err;
-        }
-    }
+    Skeleton(vec3 p, int idx) : startPos(p), idx(idx) {}
 
     void step(float dt) {
-        // ---- Euler Integrate Gravity & Draw ----
         for (Bone* b : bones) {
-            b->vel += g * dt;
-            b->vel    *= 1.0f / (1.0f + 0.7f * dt);
-            b->angVel *= 1.0f / (1.0f + 0.7f * dt);
-            b->draw();
+            // Update bone physics here
         }
-        // ---- Solve Joints & Apply Torque---
-        for(int i=0;i<50;i++) {
-            for (Joint& j : joints){
-                j.solve(dt);
-                j.applyTorque(dt);
-            }
-        }
-        // ---- Euler Integrate ----
-        for (Bone* b : bones) {
-            b->pos += b->vel * dt;
-            b->angVel = glm::clamp(b->angVel, -50.0f, 50.0f);
-            b->vel    = glm::clamp(b->vel, vec2(-3000.0f), vec2(3000.0f));
-            b->angle += b->angVel * dt;
-            checkBorderCollision(b);
+        for (Joint& j : joints) {
+            // Solve joint constraints here
         }
     }
-    void reset() {
-        init(startPos, 0.3f);
-    }
-    void checkBorderCollision(Bone* b) {
-        float restitution = 0.2f, slop = 0.01f, percent = 0.8f, friction = 0.8f;
-
-        vec2 dir(cos(b->angle), sin(b->angle));
-        vec2 offset = dir * b->halfLength;
-        vec2 points[2] = { b->pos - offset, b->pos + offset };
-
-        for (vec2 contact : points) {
-            vec2 normal;
-            float penetration = 0.0f;
-            bool collided = false;
-
-            // if (contact.x < b->radius) {
-            //     normal = vec2(1,0);
-            //     penetration = b->radius - contact.x;
-            //     collided = true;
-            // }
-            // else if (contact.x > engine.WIDTH - b->radius) {
-            //     normal = vec2(-1,0);
-            //     penetration = contact.x - (engine.WIDTH - b->radius);
-            //     collided = true;
-            // }
-            // else if (contact.y < b->radius) {
-            //     normal = vec2(0,1);
-            //     penetration = b->radius - contact.y;
-            //     collided = true;
-            // }
-            // else if (contact.y > engine.HEIGHT - b->radius) {
-            //     normal = vec2(0,-1);
-            //     penetration = contact.y - (engine.HEIGHT - b->radius);
-            //     collided = true;
-            // }
-            if (contact.y < b->radius) {
-                normal = vec2(0,1);
-                penetration = b->radius - contact.y;
-                collided = true;
-            }
-            if (!collided) continue;
-
-            // deal with the contacted point
-            vec2 r = contact - b->pos;
-
-            // velocity at contact
-            vec2 vel = b->vel + engine.cross(b->angVel, r);
-
-            float velAlongNormal = dot(vel, normal);
-            if (velAlongNormal > 0) continue;
-
-            float rCrossN = engine.cross(r, normal);
-            float denom = b->invMass + (rCrossN * rCrossN) * b->invInertia;
-            if (denom == 0) continue;
-
-            float jn = -(1.0f + restitution) * velAlongNormal;
-            jn /= denom;
-
-            vec2 impulse = normal * jn;
-            b->vel += impulse * b->invMass;
-            b->angVel += engine.cross(r, impulse) * b->invInertia;
-
-            b->vel.x *= friction;
-            b->vel.y *= 0.8f;
-
-            // --- 3. Positional Correction ---
-            vec2 correction = normal * percent * fmax(penetration - slop, 0.0f);
-            b->pos += correction;
+    void draw() {
+        for (Bone* b : bones) {
+            // Draw each bone here
         }
     }
 };
 vector<Skeleton*> envs {
-    new Skeleton(vec2(100,60), 0),
-    // new Skeleton(vec2(100,60), 1),
-    // new Skeleton(vec2(100,60), 2),
-    // new Skeleton(vec2(100,60), 3),
-    // new Skeleton(vec2(250,60), 4),
-    // new Skeleton(vec2(250,60), 5),
-    // new Skeleton(vec2(250,60), 6),
-    // new Skeleton(vec2(250,60), 7),
-    // new Skeleton(vec2(400,60), 8),
-    // new Skeleton(vec2(400,60), 9),
-    // new Skeleton(vec2(400,60), 10),
-    // new Skeleton(vec2(400,60), 11),
-    // new Skeleton(vec2(550,60), 12),
-    // new Skeleton(vec2(550,60), 13),
-    // new Skeleton(vec2(550,60), 14),
-    // new Skeleton(vec2(550,60), 15),
-    // new Skeleton(vec2(700,60), 16),
-    // new Skeleton(vec2(700,60), 17),
-    // new Skeleton(vec2(700,60), 18),
-    new Skeleton(vec2(700,60), 19),
+    new Skeleton(vec3(0), 0)
 };
 
+Bone testBox(vec3(-2, 1, 0), vec3(5.5f, 2.5f, 7.5f), 1.0f, vec3(0.3f, 0.6f, 0.9f));
+Bone testCapsule(vec3(0, 1, 0), vec3(2.3f, 5.5f, 0), 1.0f, vec3(0.9f, 0.4f, 0.3f));
+Bone testSphere(vec3(2, 1, 0), vec3(4.4f, 0, 0), 1.0f, vec3(0.4f, 0.9f, 0.4f));
 
-// ------------------------ File Connections ------------------------
-struct Data {
-    int sock, sendSock;
-    sockaddr_in server, python;
-    const static int revSize = NUM_ENV * ACTION_DIM;
-    const static int sendSize = NUM_ENV * STATE_DIM;
-
-    float recvBuffer[revSize], stateBuffer[sendSize];
-    bool primed = false;
-    Data() {
-        sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-        sendSock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-
-        server.sin_family = AF_INET;
-        server.sin_port = htons(5005);
-        server.sin_addr.s_addr = INADDR_ANY;
-
-        python.sin_family = AF_INET;
-        python.sin_port = htons(5006);
-        inet_pton(AF_INET, "127.0.0.1", &python.sin_addr);
-
-        bind(sock, (sockaddr*)&server, sizeof(server));
-    }
-    
-    bool receiveData() {
-        int bytesRead = recv(sock, (char*)recvBuffer, sizeof(recvBuffer), 0);
-
-        if (bytesRead < (int)(2 * sizeof(float))) return false;
-
-        if (recvBuffer[0] == -100.0f) {
-            return true; // python is asking for state
-        } else if (recvBuffer[0] == -150.0f) {
-            glfwSwapBuffers(engine.window);
-            return false;
-        } else if (recvBuffer[0] == -69.0f) {
-            envs[(int)recvBuffer[1]]->reset();
-            return false;
-        } else if (bytesRead == (int)sizeof(recvBuffer)) {
-            int i = 0;
-            for (Skeleton* env : envs) {
-                for (int j = 0; j < ACTION_DIM && j < env->joints.size(); j++) {
-                    env->joints[j].targetAngle = recvBuffer[i++];
-                }
-            }
-        }
-        return false;
-    }
-    void sendData() {
-        int i = 0;
-        for (Skeleton* env : envs) {
-            for (Bone* b : env->bones) {
-                stateBuffer[i++] = sin(b->angle);
-                stateBuffer[i++] = cos(b->angle);
-                stateBuffer[i++] = b->angVel;
-            }
-            stateBuffer[i++] = env->hip->pos.y / 600.0f;
-            stateBuffer[i++] = env->hip->pos.x / 800.0f;
-            stateBuffer[i++] = env->hip->vel.y / 600.0f;
-            stateBuffer[i++] = env->hip->vel.x / 800.0f;
-            stateBuffer[i++] = (env->calfL->pos.y - fabsf(sin(env->calfL->angle)) * env->calfL->halfLength <= env->calfL->radius + 1.0f) ? 1.0f : 0.0f;
-            stateBuffer[i++] = (env->calfR->pos.y - fabsf(sin(env->calfR->angle)) * env->calfR->halfLength <= env->calfR->radius + 1.0f) ? 1.0f : 0.0f;
-        }
-
-        sendto(sendSock, (char*)stateBuffer, i * sizeof(float), 0, (sockaddr*)&python, sizeof(python));
-    }
-};
-Data dataManager;
-
-void tempKeyControl(GLFWwindow* w) {
-    static int jointIdx = 0;
-    static bool upPressed = false, downPressed = false;
-    float delta = 0.005f;
-    int n = envs[0]->joints.size();
-    // cout<<"target angle:" <<envs[0]->joints[jointIdx].targetAngle<<endl;
-
-    // Cycle through joint indices (single press detection)
-    bool up = glfwGetKey(w, GLFW_KEY_UP) == GLFW_PRESS;
-    if (up && !upPressed) {
-        jointIdx = (jointIdx + 1) % n;
-        cout << "Selected Joint Index: " << jointIdx << endl;
-    }
-    upPressed = up;
-
-    bool down = glfwGetKey(w, GLFW_KEY_DOWN) == GLFW_PRESS;
-    if (down && !downPressed) {
-        jointIdx = (jointIdx - 1 + n) % n;
-        cout << "Selected Joint Index: " << jointIdx << endl;
-    }
-    downPressed = down;
-
-    // Adjust target angle for selected joint (continuous hold)
-    if (glfwGetKey(w, GLFW_KEY_LEFT) == GLFW_PRESS)
-        for (auto* e : envs) e->joints[jointIdx].targetAngle -= delta;
-    if (glfwGetKey(w, GLFW_KEY_RIGHT) == GLFW_PRESS)
-        for (auto* e : envs) e->joints[jointIdx].targetAngle += delta;
-}
-
-// ------------------------ MAIN ------------------------
-int timer = 0;
+// ================= main loop ================= //
 int main() {
-    srand(time(0) * 1234567891ULL ^ (uint64_t)clock());
+    while (!glfwWindowShouldClose(engine.window)) {
+        engine.beginFrame();
+        grid.draw();
+        testBox.drawBox();
+        testCapsule.drawCapsule();
+        testSphere.drawCapsule();
 
-    float dt = 1.0/60.0;
-    double lastPrintTime = 0.0;
-    glfwSwapBuffers(engine.window);
-    while(!glfwWindowShouldClose(engine.window)) {
-        engine.run();
-
-        tempKeyControl(engine.window);
-
-        // ------ RECIEVE DATA FROM PYTHON -------
-        bool gotAction = dataManager.receiveData();
-
-        for (Skeleton* env : envs) {
-            env->step(dt);
-        }
-
-        // ------ SEND DATA TO PYTHON -------
-        if (gotAction) {
-            dataManager.sendData();
-        }
-        // timer++;
-        // if (timer % 2500 == 0) {
-            glfwSwapBuffers(engine.window);
-        // }
+        glfwSwapBuffers(engine.window);
         glfwPollEvents();
     }
-
-    // Exit Program
-    glfwTerminate(); return 0;
+    glfwTerminate();
+    return 0;
 }

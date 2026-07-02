@@ -1,0 +1,43 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(perl -0pi -e 's/\\(\\\\s*\\)glfwSwapBuffers\\\\\\(engine\\\\.window\\\\\\);/$1static int _f=0; if\\(++_f%30==0\\){auto*r=envs[0]->root; auto*f=envs[0]->ankleR; fprintf\\(stderr,\"t=%d rootY=%.3f footY=%.3f vel=%.2f\\\\\\\\n\",_f,r->pos.y,f->pos.y,glm::length\\(r->vel\\)\\);}$1glfwSwapBuffers\\(engine.window\\);/' src/mma.cpp)",
+      "Bash(timeout 5 /tmp/claude-1000/-home-kavang-Desktop-mma/5d0675c4-ff98-4bea-9df8-3bbb33ddff68/scratchpad/mma_dbg)",
+      "Bash(echo \"CLEAN_BUILD_EXIT=$?\")",
+      "Bash(perl -0pi -e 's/\\(\\\\s*\\)glfwSwapBuffers\\\\\\(engine\\\\.window\\\\\\);/$1static int _f=0; if\\(++_f%30==0\\){auto*r=envs[0]->root; auto*f=envs[0]->ankleR; float fb=1e9; std::vector<std::pair<glm::vec3,float>>cs; f->contacts\\(cs\\); for\\(auto\\\\&c:cs\\) fb=std::min\\(fb,c.first.y-c.second\\); fprintf\\(stderr,\"t=%d rootY=%.3f footBottom=%.3f vel=%.2f\\\\\\\\n\",_f,r->pos.y,fb,glm::length\\(r->vel\\)\\);}$1glfwSwapBuffers\\(engine.window\\);/' src/mma.cpp)",
+      "Bash(g++ src/mma.cpp -o /tmp/mma_test -lglfw -lGLEW -lGL -ldl -lpthread)",
+      "Bash(timeout 3 /tmp/mma_test)",
+      "Bash(echo \"exit code: $?\")",
+      "Read(//home/kavang/**)",
+      "Bash(find / -maxdepth 6 -iname \"hyprland.conf\")",
+      "Bash(/tmp/mma_test)",
+      "Bash(xprop -name \"3D Viewer\" WM_CLASS)",
+      "Bash(hyprctl clients *)",
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\([{'title':c['title'],'class':c['class'],'floating':c['floating']} for c in d]\\)\")",
+      "Bash(kill %1)",
+      "Bash(timeout 3 /tmp/test_class)",
+      "Bash(xprop -name \"ClassTest\" WM_CLASS)",
+      "Bash(python3 -c ' *)",
+      "Bash(wait)",
+      "Bash(g++ 2D/mma2D.cpp -o /tmp/mma2d_test -lglfw -lGLEW -lGL -lpthread)",
+      "Bash(timeout 3 /tmp/mma2d_test)",
+      "Bash(xprop -name \"RL is pain\" WM_CLASS)",
+      "Bash(echo \"exit: $?\")",
+      "Bash(hyprctl reload *)",
+      "Bash(g++ /home/kavang/Desktop/mma/src/mma.cpp -o /tmp/mma_test2 -lglfw -lGLEW -lGL -ldl -lpthread)",
+      "Bash(rm -f /tmp/mma_test /tmp/mma_test2 /tmp/mma2d_test /tmp/test_class /tmp/test_class2 /tmp/test_class.cpp /tmp/test_class2.cpp)",
+      "Bash(g++ /home/kavang/Desktop/mma/src/mma.cpp -o /tmp/mma_test3 -lglfw -lGLEW -lGL -ldl -lpthread)",
+      "Bash(hyprctl -j getoption general:no_border_on_floating)",
+      "Bash(hyprctl commands *)",
+      "Bash(find /tmp /run -iname \"*hypr*log*\" 2>/dev/null | head; ls -la /tmp/hypr 2>/dev/null | head -20)",
+      "Read(//run/**)",
+      "Bash(hyprctl monitors *)",
+      "Bash(python3 -c \"import json,sys; [print\\(m['width'],m['height']\\) for m in json.load\\(sys.stdin\\)]\")",
+      "Bash(g++ /home/kavang/Desktop/mma/src/mma.cpp -o /tmp/mma_bones -lglfw -lGLEW -lGL -ldl -lpthread)"
+    ],
+    "additionalDirectories": [
+      "/home/kavang/.config/hypr",
+      "/tmp"
+    ]
+  }
+}
