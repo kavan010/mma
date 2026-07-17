@@ -8,6 +8,7 @@
             "args": [
                 "src/mma.cpp",
                 "-g",
+                "-O2",
                 "-o",
                 "mma",
                 "-fopenmp",   // add this
