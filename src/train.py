@@ -18,14 +18,12 @@ NUM_JOINTS = 13
 
 NUM_SKILLS = 6
 TARGET_DIM = 3
-RAW_STATE_DIM = 2 + NUM_LINKS * 13          # what the C++ sim actually sends per env
+RAW_STATE_DIM = 2 + NUM_LINKS * 14          # what the C++ sim actually sends per env (13 + grounded flag)
 state_dim = RAW_STATE_DIM + NUM_SKILLS + TARGET_DIM  # what the policy/critic sees
 action_dim = 3 * NUM_JOINTS
 
 ENT_COEF   = 0.0
 UNIT_M       = 0.05
-ET_HEAD  = 26.0
-ET_CHEST = 18.0
 
 N = 100000
 T = 1024
@@ -105,7 +103,7 @@ class ActorCritic(nn.Module):
 
     def forward(self, s):
         s_in = s.clone()
-        body = s_in[:, 2:RAW_STATE_DIM].view(-1, NUM_LINKS, 13)
+        body = s_in[:, 2:RAW_STATE_DIM].view(-1, NUM_LINKS, 14)
         body[..., 1] -= s_in[:, 1:2]  # link y: absolute -> root-relative, before root itself is scaled
         s_in[:, 1] *= 0.05
         body[..., 0:3] *= 0.2
@@ -157,44 +155,51 @@ class RolloutBuffer:
 
         self.advantages = adv
         self.returns = [a + v for a, v in zip(adv, self.values)]
-        print(f"[{iteration}] reward: {avg_reward:.3f} | advantages mean: {torch.stack(adv).mean().item():.3f}")
+        print(f"\n[{iteration}] reward: {avg_reward:.3f} | advantages mean: {torch.stack(adv).mean().item():.3f}")
         return avg_reward
 
     # reward n' done functions
     def getReward(self, state):
         i = ref.idx(state[:, 0])
-        body = state[:, 2:RAW_STATE_DIM].view(-1, NUM_LINKS, 13)
+        body = state[:, 2:RAW_STATE_DIM].view(-1, NUM_LINKS, 14)
         pos, quat, ang = body[..., 0:3], body[..., 3:7], body[..., 10:13]
 
+        # pose: per-joint + root rotation quaternion error
         q_sim = qmul(qconj(quat[:, PARENT]), quat[:, CHILD])
         dq = qmul(qconj(q_sim), ref.joint_q[i])
         pose_err = (2.0 * torch.acos(dq[..., 0].abs().clamp(max=1.0))).pow(2).sum(-1)
 
         dq_root = qmul(qconj(quat[:, ROOT]), ref.root_q[i])
-        pose_err = pose_err + (2.0 * torch.acos(dq_root[..., 0].abs().clamp(max=1.0))).pow(2)
+        root_rot_err = (2.0 * torch.acos(dq_root[..., 0].abs().clamp(max=1.0))).pow(2)
+        pose_err = pose_err + root_rot_err
+        r_pose = torch.exp(-(2.0 / 15.0 * NUM_JOINTS) * pose_err)
 
-        r_pose = torch.exp(-2.0 * pose_err)
+        # velocity: per-joint angular velocity error
+        ang_rel_sim = qrot(qconj(quat[:, PARENT]), ang[:, CHILD] - ang[:, PARENT])
+        vel_err = (ang_rel_sim - ref.joint_av[i]).pow(2).sum(-1).sum(-1)
+        r_vel = torch.exp(-(0.1 / 15.0 * NUM_JOINTS) * vel_err)
 
-        dv = (ang[:, CHILD] - ang[:, PARENT]) - ref.joint_av[i]
-        r_vel = torch.exp(-0.1 * dv.pow(2).sum(-1).sum(-1))
-
+        # end-effector: hand/foot position error
         de = (pos[:, END_EFFECTORS] - ref.link_p[i][:, END_EFFECTORS]) * UNIT_M
-        r_end = torch.exp(-40.0 * de.pow(2).sum(-1).sum(-1))
+        r_end = torch.exp(-10.0 * de.pow(2).sum(-1).sum(-1))
 
+        # root: position + rotation + linear/angular velocity error
+        root_pos_err = ((pos[:, ROOT] - ref.link_p[i][:, ROOT]) * UNIT_M).pow(2).sum(-1)
+        root_lin_vel_err = ((body[:, ROOT, 7:10] - ref.root_vel[i]) * UNIT_M).pow(2).sum(-1)
+        root_ang_vel_err = (ang[:, ROOT] - ref.root_ang_vel[i]).pow(2).sum(-1)
+        root_err = root_pos_err + 0.1 * root_rot_err + 0.01 * root_lin_vel_err + 0.001 * root_ang_vel_err
+        r_root = torch.exp(-5.0 * root_err)
+
+        # center of mass: position error
         com = (pos * LINK_MASS.view(1, -1, 1)).sum(1) / LINK_MASS.sum()
         dc = (com - ref.com[i]) * UNIT_M
         r_com = torch.exp(-10.0 * dc.pow(2).sum(-1))
 
-        # drift penalty
-        root_vel_xz = body[:, ROOT, 7:10:2]  # pelvis vel.x, vel.z (raw, unrelativized)
-        r_drift = torch.exp(-1.0 * root_vel_xz.pow(2).sum(-1))
-
-        return 0.65 * r_pose + 0.05 * r_vel + 0.15 * r_end + 0.0 * r_com + 0.15 * r_drift
+        return 0.5 * r_pose + 0.05 * r_vel + 0.15 * r_end + 0.2 * r_root + 0.1 * r_com
     def isDone(self, state):
-        body = state[:, 2:RAW_STATE_DIM].view(-1, NUM_LINKS, 13)
-        head_y  = body[:, 13, 1]  # link y is world-absolute, not root-relative
-        chest_y = body[:, 8, 1]
-        return (head_y < ET_HEAD) | (chest_y < ET_CHEST)
+        body = state[:, 2:RAW_STATE_DIM].view(-1, NUM_LINKS, 14)
+        grounded = body[:, :, 13]
+        return (grounded[:, 2:] > 0.5).any(dim=-1)
 
     def clear(self):
         self.__init__()
@@ -208,14 +213,21 @@ class Reference:
             self.link_p   = torch.tensor(d["link_p"],   dtype=torch.float32)
             self.joint_av = torch.tensor(d["joint_av"], dtype=torch.float32)
             self.com      = torch.tensor(d["com"],      dtype=torch.float32)
+            # baked in animate.cpp's saveCSV, only present in bakes made after root
+            # velocity was added -> fall back to zeros for older motion.npz files
+            F = self.joint_q.shape[0]
+            self.root_vel     = torch.tensor(d["root_vel"],     dtype=torch.float32) if "root_vel" in d else torch.zeros(F, 3)
+            self.root_ang_vel = torch.tensor(d["root_ang_vel"], dtype=torch.float32) if "root_ang_vel" in d else torch.zeros(F, 3)
             print(f"Loaded reference motion: {self.joint_q.shape[0]} frames")
         else:
-            body = state[0, 2:RAW_STATE_DIM].view(NUM_LINKS, 13)
+            body = state[0, 2:RAW_STATE_DIM].view(NUM_LINKS, 14)
             quat = body[:, 3:7]
             self.joint_q  = qmul(qconj(quat[PARENT]), quat[CHILD]).unsqueeze(0)
             self.link_p   = body[:, 0:3].unsqueeze(0)
             self.joint_av = torch.zeros(1, NUM_JOINTS, 3)
             self.com      = (self.link_p * LINK_MASS.view(1, -1, 1)).sum(1) / LINK_MASS.sum()
+            self.root_vel     = torch.zeros(1, 3)
+            self.root_ang_vel = torch.zeros(1, 3)
             print("No motion.npz -> using captured standing pose as 1-frame reference")
 
         self.root_q = derive_root_quat(self.joint_q, self.link_p)
@@ -230,13 +242,6 @@ class Reference:
         # never in the action path -> at test time no reference is needed.
         return action.view(NUM_ENVS, NUM_JOINTS, 3)
 
-def pad_skill(raw):
-    n = raw.shape[0]
-    skills = torch.zeros(n, NUM_SKILLS)
-    skills[:, 0] = 1.0
-    targets = torch.zeros(n, TARGET_DIM)
-    return torch.cat([raw, skills, targets], dim=1)
-
 class UDP:
     def __init__(self, ip, recv_port, send_port):
         self.recv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -250,16 +255,23 @@ class UDP:
     def send_actions(self, actions):
         self.send_sock.sendto(struct.pack(f"{len(actions)}f", *actions), self.send_addr)
 
+    def pad_skill(self, raw):
+        n = raw.shape[0]
+        skills = torch.zeros(n, NUM_SKILLS)
+        skills[:, 0] = 1.0
+        targets = torch.zeros(n, TARGET_DIM)
+        return torch.cat([raw, skills, targets], dim=1)
+
     def get_state(self):
         self.send_actions([-100.0] * action_dim)
         raw = torch.tensor(self.receive_state(), dtype=torch.float32).view(NUM_ENVS, RAW_STATE_DIM)
-        return pad_skill(raw)
+        return self.pad_skill(raw)
 
     def step(self, target):
         self.send_actions(target.flatten().tolist())
         raw = torch.tensor(self.receive_state(), dtype=torch.float32).view(NUM_ENVS, RAW_STATE_DIM)
-        raw[:, 0] = phase
-        s = pad_skill(raw)
+        raw[:, 0] = (phase + ref.dphase) % 1.0  # label the post-step state with the post-step phase
+        s = self.pad_skill(raw)
         return s, buffer.getReward(s), buffer.isDone(s)
     def send_reset(self, env_idx, ph):
         self.send_actions([-69.0, float(env_idx), float(ph)])
@@ -328,13 +340,13 @@ if os.path.exists("POLICY_3D.pt"):
 
 # ---------------------- train ----------------------
 for iteration in range(start_iteration, N):
-    current_std = max(0.05, 0.15 - (0.10 * (iteration / 1100.0)))
+    current_std = max(0.05, 0.05 - (0.00 * (iteration / 1500.0)))
     model.log_std.data.fill_(math.log(current_std))
     buffer.clear()
 
     # data collection
     for t in range(T):
-        state_batch[:, 0] = 0
+        state_batch[:, 0] = phase
         with torch.no_grad():
             dist, value = model(state_batch)
         action = torch.clamp(dist.sample(), -math.pi, math.pi)

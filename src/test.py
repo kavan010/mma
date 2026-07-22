@@ -5,15 +5,14 @@ import math, socket, struct
 from time import sleep
 
 # ---- config ----
-NUM_ENVS = 25     # how many envs to run
+NUM_ENVS = 1     # how many envs to run
 DPHASE   = 0.0    # phase increment per step. 0 for a still frame; set 1/num_frames for a motion clip.
 
 NUM_LINKS, NUM_JOINTS = 14, 13
 NUM_SKILLS, TARGET_DIM = 6, 3
-RAW_STATE_DIM = 2 + NUM_LINKS * 13
+RAW_STATE_DIM = 2 + NUM_LINKS * 14
 state_dim = RAW_STATE_DIM + NUM_SKILLS + TARGET_DIM
 action_dim = 3 * NUM_JOINTS
-ET_HEAD, ET_CHEST = 26.0, 18.0
 
 
 class ActorCritic(nn.Module):
@@ -25,7 +24,7 @@ class ActorCritic(nn.Module):
             nn.Linear(1024, 512),
             nn.Tanh(),
             nn.Linear(512, action_dim))
-        self.log_std = nn.Parameter(torch.full((action_dim,), math.log(0.15)))
+        self.log_std = nn.Parameter(torch.full((action_dim,), math.log(0.05)))
         self.critic_net = nn.Sequential(   # kept only so load_state_dict matches
             nn.Linear(state_dim, 1024),
             nn.Tanh(),
@@ -35,7 +34,7 @@ class ActorCritic(nn.Module):
 
     def act(self, s):
         s_in = s.clone()
-        body = s_in[:, 2:RAW_STATE_DIM].view(-1, NUM_LINKS, 13)
+        body = s_in[:, 2:RAW_STATE_DIM].view(-1, NUM_LINKS, 14)
         body[..., 1] -= s_in[:, 1:2]  # link y: absolute -> root-relative, before root itself is scaled
         s_in[:, 1] *= 0.05
         body[..., 0:3] *= 0.2
@@ -50,8 +49,9 @@ model.eval()
 
 
 def isDone(state):
-    body = state[:, 2:RAW_STATE_DIM].view(-1, NUM_LINKS, 13)
-    return (body[:, 13, 1] < ET_HEAD) | (body[:, 8, 1] < ET_CHEST)
+    body = state[:, 2:RAW_STATE_DIM].view(-1, NUM_LINKS, 14)
+    grounded = body[:, :, 13]
+    return (grounded[:, 2:] > 0.5).any(dim=-1)
 
 
 def pad_skill(raw):

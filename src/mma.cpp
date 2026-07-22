@@ -14,6 +14,9 @@
 #include <arpa/inet.h>
 #include <thread>
 #include <chrono>
+#include <fstream>
+#include <sstream>
+#include <string>
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -209,6 +212,7 @@ struct Bone {
     float mass, invMass;
     mat3 invInertiaBody = mat3(0.0f);
     int shape; // 1 = box, 2 = capsule
+    bool grounded = false;
 
     vec3 color;
     GLuint VAO = 0, VBO = 0, lineVAO = 0, lineVBO = 0;
@@ -397,56 +401,6 @@ struct Skeleton {
     Bone *footR, *footL, *calfR, *calfL, *thighR, *thighL, *pelvis, *abs, *chest, *head, *armR, *armL, *forearmR, *forearmL;
     Bone *ball = nullptr, *clavR = nullptr, *clavL = nullptr; // visual only
 
-
-    // init stance pos
-    const float STANCE_POS[14][3] = {
-        {1.521090f, 0.974665f, 12.177600f},   // footR
-        {1.582080f, 0.774498f, -12.612000f},  // footL
-        {1.224280f, 5.075910f, 9.682480f},    // calfR
-        {1.267240f, 4.900310f, -10.265200f},  // calfL
-        {0.434122f, 11.973700f, 4.446820f},   // thighR
-        {0.510581f, 11.921400f, -5.216140f},  // thighL
-        {-0.457279f, 16.604800f, -0.411074f}, // pelvis
-        {-0.639560f, 20.199600f, -0.368656f}, // abs
-        {-0.855819f, 24.392900f, -0.284394f}, // chest
-        {-1.699530f, 24.258900f, 5.801360f},  // armR
-        {2.676960f, 23.962300f, -1.950020f},  // armL
-        {-0.407961f, 24.173700f, 10.885700f}, // forearmR
-        {4.041150f, 23.393700f, 1.918580f},   // forearmL
-        {-1.203420f, 29.378200f, -0.140704f}, // head
-    };
-    const float STANCE_QUAT[14][4] = { // w x y z, same bone order
-        {0.850896f, 0.022381f, -0.524006f, 0.029886f},
-        {0.875461f, -0.008252f, 0.481058f, 0.045634f},
-        {0.701221f, 0.063956f, -0.365869f, -0.608554f},
-        {0.671090f, -0.200777f, 0.465063f, -0.541335f},
-        {0.763015f, -0.087292f, -0.424343f, -0.479710f},
-        {0.764256f, -0.082930f, 0.511026f, -0.384562f},
-        {0.999467f, 0.002136f, -0.011047f, 0.030636f},
-        {0.995071f, 0.011874f, -0.096612f, 0.018935f},
-        {0.968944f, 0.017142f, -0.245237f, 0.026686f},
-        {0.807513f, 0.088088f, -0.534482f, -0.233437f},
-        {0.874361f, 0.110635f, -0.327750f, -0.340342f},
-        {0.730470f, 0.093130f, -0.525397f, 0.426261f},
-        {0.585477f, -0.273231f, -0.748518f, 0.149274f},
-        {0.834359f, 0.039690f, -0.549296f, 0.023307f},
-    };
-    const float STANCE_TARGET[13][3] = { // PD targets (axis-angle), joint order = Skeleton::joints
-        {0.014000f, -0.172000f, -0.023000f},
-        {0.007000f, -0.302000f, 0.019000f},
-        {0.031000f, -0.668994f, 0.000000f},
-        {0.000000f, -0.672995f, -0.536775f},
-        {0.000000f, -0.230000f, -0.769774f},
-        {0.780994f, 0.055000f, 1.104996f},
-        {0.000000f, -1.212000f, 1.128998f},
-        {-0.234001f, -0.903992f, -1.093773f},
-        {-0.160000f, 1.139997f, -0.892771f},
-        {0.055000f, 0.206000f, -0.376998f},
-        {0.000000f, -0.040000f, -0.442997f},
-        {0.630996f, -0.088000f, 1.222779f},
-        {-0.240001f, -0.211000f, 1.286784f},
-    };
-
     Skeleton(vec3 pos, int id) : pos(vec3(pos)), idx(id) { init(); }
 
     void init() {
@@ -507,18 +461,65 @@ struct Skeleton {
             vec3 err = (j.A->pos + j.A->orient * j.anchorA) - (j.B->pos + j.B->orient * j.anchorB);
             j.B->pos += err;
         }
-    
-        // reference state initialization: spawn in the baked stance + small noise
-        auto rnd = [](float s) { return s * (2.0f * (rand() / (float)RAND_MAX) - 1.0f); };
-        for (int i = 0; i < (int)bones.size(); i++) {
-            Bone* b = bones[i];
-            b->pos    = vec3(pos.x + STANCE_POS[i][0], STANCE_POS[i][1], pos.z + STANCE_POS[i][2]);
-            b->orient = quat(STANCE_QUAT[i][0], STANCE_QUAT[i][1], STANCE_QUAT[i][2], STANCE_QUAT[i][3]);
-            b->vel    = vec3(rnd(0.3f), rnd(0.3f), rnd(0.3f));
-            b->angVel = vec3(rnd(0.3f), rnd(0.3f), rnd(0.3f));
+    }
+
+    // frame < 0 -> random frame. phase01 in [0,1] -> the exact frame train.py's
+    // Reference.idx() would pick for that phase, so python and the sim always agree
+    // on which point in the motion the character was actually placed at after a reset.
+    void getPos(int frame = -1, float phase01 = -1.0f) {
+        static vector<vector<float>> frames;
+        if (frames.empty()) {
+            ifstream f;
+            for (const char* d : {"src/", "", "../"}) {
+                f.open(std::string(d) + "baked_motion.csv");
+                if (f.is_open()) break;
+            }
+            string line;
+            while (getline(f, line)) {
+                stringstream ss(line);
+                string cell;
+                vector<float> row;
+                while (getline(ss, cell, ',')) row.push_back(stof(cell));
+                if (row.size() >= 136) frames.push_back(row);
+            }
         }
-        for (int j = 0; j < (int)joints.size(); j++)
-            joints[j].targetAngle = vec3(STANCE_TARGET[j][0], STANCE_TARGET[j][1], STANCE_TARGET[j][2]);
+        if (frames.empty()) return;
+
+        if (phase01 >= 0.0f) frame = (int)std::round(phase01 * (frames.size() - 1));
+        else if (frame < 0) frame = rand() % frames.size();
+        vector<float>& row = frames[glm::clamp(frame, 0, (int)frames.size() - 1)];
+
+        quat jointQuat[13];
+        for (int j = 0; j < 13; j++)
+            jointQuat[j] = quat(row[j*4], row[j*4+1], row[j*4+2], row[j*4+3]);
+
+        for (int i = 0; i < (int)bones.size(); i++)
+            bones[i]->pos = vec3(pos.x + row[52 + i*3], row[52 + i*3 + 1], pos.z + row[52 + i*3 + 2]);
+
+        // pelvis world orientation, columns 137-140 (absent in old bakes -> identity)
+        pelvis->orient = row.size() >= 141 ? quat(row[137], row[138], row[139], row[140]) : quat(1, 0, 0, 0);
+        // root linear/angular velocity, columns 144-149 (absent in bakes made before
+        // this was added -> falls back to 0, same as before)
+        pelvis->vel = row.size() >= 150 ? vec3(row[144], row[145], row[146]) : vec3(0);
+        pelvis->angVel = row.size() >= 150 ? vec3(row[147], row[148], row[149]) : vec3(0);
+
+        for (int j = 0; j < (int)joints.size(); j++) {
+            Joint& jt = joints[j];
+            jt.B->orient = jt.A->orient * jointQuat[j];
+            jt.B->angVel = jt.A->angVel + jt.A->orient * vec3(row[94 + j*3], row[94 + j*3 + 1], row[94 + j*3 + 2]);
+            // rigid-body velocity transport: child inherits parent's linear velocity
+            // plus the extra linear motion caused by the parent spinning while the
+            // child sits away from it (cross(parent angvel, offset)) — no per-joint
+            // linear velocity is baked, so this is the physically correct way to get
+            // every limb moving with the body instead of only the pelvis having velocity.
+            jt.B->vel = jt.A->vel + cross(jt.A->angVel, jt.B->pos - jt.A->pos);
+
+            quat q = jointQuat[j];
+            if (q.w < 0) q = -q;
+            vec3 v(q.x, q.y, q.z);
+            float s = length(v);
+            jt.targetAngle = s < 1e-6f ? vec3(0) : (2.0f * atan2(s, q.w)) * (v / s);
+        }
     }
 
     void draw() {
@@ -619,43 +620,44 @@ struct Skeleton {
             }
         }
         b->pos += n * (percent * glm::max(maxPen - slop, 0.0f));
+        b->grounded = maxPen > 0.0f;
     }
 };
 vector<Skeleton*> envs {
     new Skeleton(vec3(0, 0, 0), 0),
 
-    new Skeleton(vec3(50, 0, 0), 1),
-    new Skeleton(vec3(-50, 0, 0), 2),
-    new Skeleton(vec3(0, 0, 50), 3),
-    new Skeleton(vec3(0, 0, -50), 4),
-    new Skeleton(vec3(50, 0, -50), 5),
-    new Skeleton(vec3(-50, 0, 50), 6),
-    new Skeleton(vec3(50, 0, 50), 7),
-    new Skeleton(vec3(-50, 0, -50), 8),
+    // new Skeleton(vec3(50, 0, 0), 1),
+    // new Skeleton(vec3(-50, 0, 0), 2),
+    // new Skeleton(vec3(0, 0, 50), 3),
+    // new Skeleton(vec3(0, 0, -50), 4),
+    // new Skeleton(vec3(50, 0, -50), 5),
+    // new Skeleton(vec3(-50, 0, 50), 6),
+    // new Skeleton(vec3(50, 0, 50), 7),
+    // new Skeleton(vec3(-50, 0, -50), 8),
 
-    new Skeleton(vec3(100, 0, 0), 9),
-    new Skeleton(vec3(-100, 0, 0), 10),
-    new Skeleton(vec3(0, 0, 100), 11),
-    new Skeleton(vec3(0, 0, -100), 12),
-    new Skeleton(vec3(100, 0, -100), 13),
-    new Skeleton(vec3(-100, 0, 100), 14),
-    new Skeleton(vec3(100, 0, 100), 15),
-    new Skeleton(vec3(-100, 0, -100), 16),
+    // new Skeleton(vec3(100, 0, 0), 9),
+    // new Skeleton(vec3(-100, 0, 0), 10),
+    // new Skeleton(vec3(0, 0, 100), 11),
+    // new Skeleton(vec3(0, 0, -100), 12),
+    // new Skeleton(vec3(100, 0, -100), 13),
+    // new Skeleton(vec3(-100, 0, 100), 14),
+    // new Skeleton(vec3(100, 0, 100), 15),
+    // new Skeleton(vec3(-100, 0, -100), 16),
 
-    new Skeleton(vec3(100, 0, 50), 17),
-    new Skeleton(vec3(100, 0, -50), 18),
-    new Skeleton(vec3(50, 0, 100), 19),
-    new Skeleton(vec3(-50, 0, 100), 20),
-    new Skeleton(vec3(50, 0, -100), 21),
-    new Skeleton(vec3(-50, 0, -100), 22),
-    new Skeleton(vec3(-100, 0, 50), 23),
-    new Skeleton(vec3(-100, 0, -50), 24),
+    // new Skeleton(vec3(100, 0, 50), 17),
+    // new Skeleton(vec3(100, 0, -50), 18),
+    // new Skeleton(vec3(50, 0, 100), 19),
+    // new Skeleton(vec3(-50, 0, 100), 20),
+    // new Skeleton(vec3(50, 0, -100), 21),
+    // new Skeleton(vec3(-50, 0, -100), 22),
+    // new Skeleton(vec3(-100, 0, 50), 23),
+    // new Skeleton(vec3(-100, 0, -50), 24),
 
 };
 
 // ================= UDP ================= //
 const int ACTION_DIM = 3 * 13;      // 3 axis per joint
-const int STATE_DIM  = 2 + 14 * 13; // phase, root_height, then 14 links x [pos3 quat4 linvel3 angvel3]
+const int STATE_DIM  = 2 + 14 * 14; // phase, root_height, then 14 links x [pos3 quat4 linvel3 angvel3 grounded1]
 struct Data {
     int sock, sendSock;
     sockaddr_in server, python;
@@ -687,9 +689,10 @@ struct Data {
             return true; // asking for state, no step
         } else if (recvBuffer[0] == -69.0f) {
             int idx = (int)recvBuffer[1];
+            float phase = recvBuffer[2]; // train.py's send_reset(env_idx, phase)
             if (idx >= 0 && idx < (int)envs.size()) {
                 Skeleton* env = envs[idx];
-                env->init(); // reset
+                env->getPos(-1, phase); // same frame train.py's Reference.idx(phase) picks
             }
             return false;
         } else if (bytesRead == (int)(envs.size() * ACTION_DIM * sizeof(float))) {
@@ -727,6 +730,7 @@ struct Data {
                 stateBuffer[i++] = b->angVel.x;
                 stateBuffer[i++] = b->angVel.y;
                 stateBuffer[i++] = b->angVel.z;
+                stateBuffer[i++] = b->grounded ? 1.0f : 0.0f;
             }
         }
         sendto(sendSock, (char*)stateBuffer.data(), i * sizeof(float), 0, (sockaddr*)&python, sizeof(python));
@@ -766,11 +770,10 @@ int main() {
 
         engine.beginFrame();
         grid.draw();
-        for (Skeleton* skeleton : envs) skeleton->draw();
+        for (Skeleton* skeleton : envs) {skeleton->draw();}
 
         if (++timer % frameDivider == 0){
             glfwSwapBuffers(engine.window);
-            if (frameDivider != 1) std::cout << "frame updated (divider=" << frameDivider << ")" << std::endl;
             timer = 0;
         }
         glfwPollEvents();
